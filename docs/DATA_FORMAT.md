@@ -124,20 +124,33 @@ are numeric, ISO-8601, or single uppercase letters).
 | 13 | `sizing_version` | provenance | Int, empty if absent |
 | 14 | `calibration_source` | provenance | empty if absent |
 | 15 | `points_per_mm` | provenance | `%.4f`, empty if absent |
-| 16 | `screen_signature` | provenance | empty if absent |
+| 16 | `screen_signature` | provenance | **RFC-4180 quoted when it contains a comma**; empty if absent |
 | 17 | `target_height_mm` | provenance | `%.3f`, empty if absent |
 | 18 | `rendered_height_points` | provenance | `%.2f`, empty if absent |
 
-> **Note for parsers:** `screen_signature` contains `|` separators but no commas, so naive
-> comma-splitting is safe for the current schema. Session-level results (per-condition logMAR, the
-> duochrome delta, the interpretation) are **not** in the CSV — read the JSON for those.
+> **Use a real CSV parser — do not split on commas.** `screen_signature` embeds the device machine
+> identifier, which is `iPhone17,1`-shaped on **every real device**, so it almost always contains a
+> comma. `SessionStore.csvField` wraps such values in double quotes and doubles any embedded quote,
+> per RFC 4180. Naive comma-splitting will misalign every provenance column.
+>
+> Session-level results (per-condition logMAR, the duochrome delta, the interpretation) are **not**
+> in the CSV — read the JSON for those.
 
 ### Example
 
+Note the quoted `screen_signature` field:
+
 ```csv
 session_id,started_at,condition,acuity_20x,shown_letter,response,is_correct,distance_cm,sizing_distance_cm,response_time_ms,trial_number,timestamp,sizing_version,calibration_source,points_per_mm,screen_signature,target_height_mm,rendered_height_points
-5B1E...,2026-08-03T20:15:02Z,highContrast,40,K,K,1,201.4,200.0,1840,1,2026-08-03T20:15:31Z,2,deviceDatabase,6.0367,iPhone17.1|1206x2622|3.0000,5.818,35.13
-5B1E...,2026-08-03T20:15:02Z,highContrast,40,V,V,1,199.8,199.8,1620,2,2026-08-03T20:15:35Z,2,deviceDatabase,6.0367,iPhone17.1|1206x2622|3.0000,5.812,35.09
+5B1E...,2026-08-03T20:15:02Z,highContrast,40,K,K,1,201.4,200.0,1840,1,2026-08-03T20:15:31Z,2,deviceDatabase,6.0367,"iPhone17,1|1206x2622|3.0000",5.818,35.13
+5B1E...,2026-08-03T20:15:02Z,highContrast,40,V,V,1,199.8,199.8,1620,2,2026-08-03T20:15:35Z,2,deviceDatabase,6.0367,"iPhone17,1|1206x2622|3.0000",5.812,35.09
+```
+
+Loading in pandas or R needs no special handling — both honour RFC-4180 quoting by default:
+
+```python
+import pandas as pd
+df = pd.read_csv("<sessionID>.csv")     # screen_signature comes back intact
 ```
 
 ---

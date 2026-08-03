@@ -66,6 +66,12 @@ struct RetryEscalationPolicy: Equatable {
         attemptsThisTrial = 0
     }
 
+    /// Keypad-only start from the setup screen: manual mode is sticky from the first trial and
+    /// survives resolved letters until the clinician explicitly restores voice.
+    mutating func forceStickyManual() {
+        isStickyManual = true
+    }
+
     private mutating func noteEscalation() {
         consecutiveEscalatedTrials += 1
         if consecutiveEscalatedTrials >= config.stickyManualAfterConsecutiveEscalations {

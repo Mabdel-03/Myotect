@@ -80,13 +80,23 @@ struct SessionStore {
                 trial.provenance.map { String($0.sizingVersion) } ?? "",
                 trial.provenance?.calibrationSource.rawValue ?? "",
                 trial.provenance.map { String(format: "%.4f", $0.pointsPerMillimeter) } ?? "",
-                trial.provenance?.screenSignature ?? "",
+                Self.csvField(trial.provenance?.screenSignature ?? ""),
                 trial.provenance.map { String(format: "%.3f", $0.targetHeightMillimeters) } ?? "",
                 trial.provenance.map { String(format: "%.2f", $0.renderedHeightPoints) } ?? "",
             ].joined(separator: ",")
         }
 
         return ([header] + rows).joined(separator: "\n")
+    }
+
+    /// RFC-4180 quoting for a field that can contain commas: screen signatures embed the device
+    /// machine identifier, which is "iPhone15,3"-shaped on every real device — unquoted it would
+    /// misalign every provenance row.
+    static func csvField(_ value: String) -> String {
+        guard value.contains(",") || value.contains("\"") || value.contains("\n") else {
+            return value
+        }
+        return "\"" + value.replacingOccurrences(of: "\"", with: "\"\"") + "\""
     }
 
     private func sessionsDirectory() throws -> URL {

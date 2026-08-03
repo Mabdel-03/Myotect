@@ -80,6 +80,42 @@ final class SessionStoreTests: XCTestCase {
         }
     }
 
+    func testCommaBearingScreenSignatureStaysAlignedInCSV() {
+        // Real device identifiers contain commas ("iPhone15,3"); unquoted they would misalign
+        // every provenance row.
+        let provenance = SizingProvenance(
+            sizingVersion: SizingProvenance.currentVersion,
+            calibrationSource: .deviceDatabase,
+            pointsPerMillimeter: 4.2782,
+            screenSignature: "iPhone15,3|2796x1290|3.0000",
+            targetHeightMillimeters: 5.818,
+            renderedHeightPoints: 24.89)
+        let trial = TrialResult(condition: .highContrast, acuityDenominator: 40, shownLetter: "C",
+                                response: "C", isCorrect: true, distanceCM: 200,
+                                responseTimeMS: 800, trialNumber: 1,
+                                timestamp: Date(timeIntervalSince1970: 1_700_000_050),
+                                provenance: provenance)
+        let csv = SessionStore().csv(for: makeSession(trials: [trial]))
+        let lines = csv.split(separator: "\n").map(String.init)
+        XCTAssertEqual(lines.count, 2)
+        XCTAssertTrue(lines[1].contains("\"iPhone15,3|2796x1290|3.0000\""))
+
+        // Quote-aware field count of the data row must equal the header's.
+        func fields(_ row: String) -> [String] {
+            var out: [String] = []
+            var current = ""
+            var inQuotes = false
+            for ch in row {
+                if ch == "\"" { inQuotes.toggle() } else if ch == ",", !inQuotes {
+                    out.append(current); current = ""
+                } else { current.append(ch) }
+            }
+            out.append(current)
+            return out
+        }
+        XCTAssertEqual(fields(lines[1]).count, fields(lines[0]).count)
+    }
+
     func testDeltaIsGreenMinusRed() {
         let red = AcuityConditionResult(condition: .lowContrastRed, finestAcuityDenominator: 25, logMAR: 0.10, reachedGate: true)
         let green = AcuityConditionResult(condition: .lowContrastGreen, finestAcuityDenominator: 32, logMAR: 0.20, reachedGate: true)

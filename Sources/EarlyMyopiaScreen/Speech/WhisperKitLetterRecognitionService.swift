@@ -270,9 +270,11 @@ final class WhisperKitLetterRecognitionService: NSObject, ObservableObject, @Mai
         captureTask?.cancel()
         captureTask = nil
         // In a capture session the engine survives cancellation (disarm only); one-shot mode
-        // tears it down as before.
+        // tears it down as before — and must clear the flag, or a later beginCaptureSession
+        // would see engineRunning=true and silently skip starting the engine.
         if !captureSessionActive {
             whisperKit?.audioProcessor.stopRecording()
+            engineRunning = false
         }
         completion = nil
         lastObservedSampleCount = 0
@@ -366,6 +368,9 @@ final class WhisperKitLetterRecognitionService: NSObject, ObservableObject, @Mai
             }
             return isFinal ? .unrecognized(.silence) : nil
         }
+        // A trial superseded mid-inference must not mutate the pointer state the NEXT trial
+        // will arm with.
+        if Task.isCancelled, !isFinal { return nil }
         // Advance the consumed pointer only when this pass actually produced text (or is the
         // final flush). An empty transcription keeps the audio, so an utterance straddling a
         // poll boundary never loses its onset (gold-standard rule).
@@ -427,6 +432,16 @@ final class WhisperKitLetterRecognitionService: NSObject, ObservableObject, @Mai
         guard self.generation == generation, !didComplete else { return }
         captureTask?.cancel()
         captureTask = nil
+
+        // The poll loop may be suspended inside an inference right now; the final pass would
+        // bounce off the isRunningInference guard and misreport a real answer as silence. Wait
+        // (bounded) for it to drain before flushing.
+        var waited: TimeInterval = 0
+        while isRunningInference, waited < 2.0 {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            waited += 0.05
+        }
+        guard self.generation == generation, !didComplete else { return }
 
         var outcome: RecognitionOutcome = .unrecognized(.silence)
         if let kit = whisperKit {

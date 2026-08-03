@@ -1,11 +1,11 @@
 # Testing Myotect — complete guide
 
 This document covers everything needed to verify Myotect: the automated unit suite (how to run it,
-what every one of its 170 tests asserts), the manual on-device protocol for the parts a simulator
+what every one of its 174 tests asserts), the manual on-device protocol for the parts a simulator
 cannot exercise, physical verification of optotype size, and troubleshooting for the failure modes
 this project actually hits.
 
-**Current status: 170 tests, 0 failures** on iPhone 16 Pro / iOS 18.2.
+**Current status: 174 tests, 0 failures** on iPhone 16 Pro / iOS 18.2.
 
 **Contents**
 
@@ -64,7 +64,7 @@ xcodebuild -project Myotect.xcodeproj -scheme Myotect \
 Expected tail on a green run:
 
 ```
-Executed 170 tests, with 0 failures (0 unexpected) in 0.6 (0.8) seconds
+Executed 174 tests, with 0 failures (0 unexpected) in 0.7 (0.8) seconds
 ** TEST SUCCEEDED **
 ```
 
@@ -162,7 +162,7 @@ shown. That runs a clean pass end-to-end without a microphone.
 
 ## Part 2 — The unit suite, test by test
 
-**170 tests across 18 files.** All are `XCTest`, synchronous or `@MainActor`, and deterministic —
+**174 tests across 18 files.** All are `XCTest`, synchronous or `@MainActor`, and deterministic —
 no `Date.now` dependence in assertions, no randomness (condition order is injected via
 `lowContrastOrderOverride`), no sleeps.
 
@@ -177,10 +177,10 @@ no `Date.now` dependence in assertions, no randomness (condition order is inject
 | [OptotypeSizingTests](#optotypesizingtests--9-tests) | 9 | Physical sizing math and render damping |
 | [SizingProvenanceTests](#sizingprovenancetests--8-tests) | 8 | Provenance matching and Codable round-trips |
 | [WhisperTranscriptFilterTests](#whispertranscriptfiltertests--7-tests) | 7 | Filler / silence-hallucination rejection |
-| [CoordinatorRetryTests](#coordinatorretrytests--7-tests) | 7 | Retry → keypad escalation, end to end |
-| [RetryEscalationPolicyTests](#retryescalationpolicytests--7-tests) | 7 | The escalation state machine in isolation |
+| [CoordinatorRetryTests](#coordinatorretrytests--9-tests) | 9 | Retry → keypad escalation, end to end |
+| [RetryEscalationPolicyTests](#retryescalationpolicytests--8-tests) | 8 | The escalation state machine in isolation |
 | [ContrastPaletteTests](#contrastpalettetests--6-tests) | 6 | Weber contrast and channel isolation |
-| [SessionStoreTests](#sessionstoretests--6-tests) | 6 | JSON/CSV encoding, delta, load ordering |
+| [SessionStoreTests](#sessionstoretests--7-tests) | 7 | JSON/CSV encoding, quoting, delta, load ordering |
 | [ARKitDistanceProviderTests](#arkitdistanceprovidertests--5-tests) | 5 | Smoothing and plausibility rejection |
 | [CoordinatorTTSTests](#coordinatorttstests--5-tests) | 5 | Spoken prompts wired into the flow |
 | [SpeechAnnouncerTests](#speechannouncertests--5-tests) | 5 | Utterance lifecycle and completion-exactly-once |
@@ -384,12 +384,17 @@ light contaminates the short-wavelength stimulus, so red must be exactly 0 in th
 
 ---
 
-### SessionStoreTests — 6 tests
+### SessionStoreTests — 7 tests
 
 `testJSONRoundTrip` · `testDecodeJSONRoundTrip` (ISO-8601 dates, sorted keys) ·
 `testCSVRowCountMatchesTrials` (header + one row per trial) · `testDeltaIsGreenMinusRed` (sign
 convention: positive means red was read better) · `testDeltaNilWhenMissingCondition` (never a
 half-computed delta) · `testLoadAllSessionsReturnsSavedSessionsNewestFirst`.
+
+`testCommaBearingScreenSignatureStaysAlignedInCSV` guards a real-data trap: device machine
+identifiers are `iPhone17,1`-shaped, so an unquoted `screen_signature` would push every subsequent
+provenance column one field to the right on **every real device**. `SessionStore.csvField` applies
+RFC-4180 quoting. See [DATA_FORMAT.md](DATA_FORMAT.md#csv--trial-rows).
 
 ---
 
@@ -405,7 +410,7 @@ as a trustworthy sample, and recovery restarts smoothing with no residue) ·
 
 ---
 
-### CoordinatorRetryTests — 7 tests
+### CoordinatorRetryTests — 9 tests
 
 End-to-end escalation through the coordinator, using a mock speech service that returns non-answers.
 
@@ -417,15 +422,19 @@ End-to-end escalation through the coordinator, using a mock speech service that 
 | `testServiceFailureEscalatesImmediatelyWithAlert` | `.serviceFailure` bypasses retries entirely — it is structural |
 | `testDistancePauseRepeatDoesNotGrantExtraRetries` | A pause repeat is not an answer attempt, so it cannot farm extra retries |
 | `testConsecutiveKeypadTrialsBecomeStickyAndClinicianRestores` | Repeated escalations make manual mode sticky until explicitly restored |
+| `testKeypadOnlyStartStaysStickyAcrossResolvedLetters` | Starting keypad-only from setup stays manual even as letters resolve successfully — it must not silently drift back to a mic that was never available |
+| `testGoBackClearsNonStickyEscalationForCleanRerun` | Back re-runs a phase with escalation state reset, so a prior bad streak does not poison the retry |
 | `testWarmupEscalationScoresNothingAndKeypadAdvancesWarmup` | Escalation during warm-up records no trial but still advances |
 
-### RetryEscalationPolicyTests — 7 tests
+### RetryEscalationPolicyTests — 8 tests
 
 The same state machine in isolation: `testRetrySequenceThenEscalation` (first retry carries a spoken
 re-prompt, later ones do not) · `testBeginTrialResetsAttemptCount` ·
 `testDistancePauseRepeatsDoNotGrantExtraRetries` · `testServiceFailureEscalatesImmediately` ·
 `testStickyManualAfterConsecutiveEscalationsAndVoiceResolveClearsStreak` ·
-`testStickyManualBypassesRetries` · `testClinicianRestoreClearsStickyAndStreak`.
+`testStickyManualBypassesRetries` · `testClinicianRestoreClearsStickyAndStreak` ·
+`testForceStickyManualSurvivesResolvedTrials` (the keypad-only start latches until the clinician
+restores voice, rather than clearing on the first successful answer).
 
 ### CoordinatorTTSTests — 5 tests
 
@@ -479,11 +488,20 @@ Confirm all seven rows show a green check and that *Begin* is disabled until the
 | --- | --- |
 | Distance tracking available | Run on a non-TrueDepth device |
 | Camera permission | Deny in Settings → Myotect |
-| Microphone permission | Deny in Settings → Myotect |
-| Speech model ready | Airplane mode on first launch with no vendored model |
+| Microphone permission | Deny in Settings → Myotect (an "Open Settings" shortcut must appear) |
+| Speech model ready | Airplane mode on first launch with no vendored model (a linear progress bar shows prep phase; on failure a "Retry loading" button must appear and work) |
 | Screen calibrated | Use a device with no DevicePpi entry (must offer the ruler flow) |
 | Sloan optotype font loaded | — (verify it is checked; failure text must be loud, never a silent system-font fallback) |
 | Display fits protocol letters | — (verify on the smallest target device) |
+
+**Keypad-only fallback.** When the *voice* path is blocked (mic denied or the model failed) but
+everything sizing-related is satisfied, a secondary **"Continue with clinician keypad"** button
+appears alongside the disabled *Begin*. It starts the session in sticky manual mode. Verify that:
+
+- it appears **only** when the voice path is blocked and the sizing prerequisites all pass;
+- it does **not** appear when calibration, font, display fit, camera, or face tracking is missing —
+  those are hard requirements the keypad cannot substitute for;
+- the session stays on the keypad for every trial, including after letters resolve successfully.
 
 ### 3.3 Distance lock
 

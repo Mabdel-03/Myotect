@@ -68,6 +68,17 @@ final class RetryEscalationPolicyTests: XCTestCase {
         XCTAssertEqual(policy.actionForFailedAttempt(), .escalateToManual)
     }
 
+    func testForceStickyManualSurvivesResolvedTrials() {
+        var policy = makePolicy()
+        policy.forceStickyManual()
+        XCTAssertTrue(policy.isStickyManual)
+        // Keypad-resolved letters must not clear a forced sticky mode.
+        policy.trialResolved(byVoice: false)
+        XCTAssertTrue(policy.isStickyManual)
+        policy.clinicianRestoredVoice()
+        XCTAssertFalse(policy.isStickyManual)
+    }
+
     func testClinicianRestoreClearsStickyAndStreak() {
         var policy = makePolicy(maxRetries: 0, stickyAfter: 1)
         policy.beginTrial()

@@ -130,6 +130,9 @@ exists to guarantee that **a dead microphone can never produce a silent infinite
   sticky until the clinician explicitly restores voice input.
 - **A distance-pause repeat is not an answer attempt** and deliberately does not reset the attempt
   count, so pausing cannot be used to farm extra retries.
+- `forceStickyManual()` supports a **keypad-only start** from setup (mic denied or model failed):
+  manual mode latches from the first trial and survives resolved letters, so a session begun without
+  a usable microphone never silently drifts back to voice.
 
 ### Coordinator — the only stateful orchestrator
 

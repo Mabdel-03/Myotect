@@ -116,6 +116,9 @@ final class MyopiaScreenCoordinator: ObservableObject {
     private var speechEventsSub: AnyCancellable?
     private var captureEventsSub: AnyCancellable?
     private var okDismissTask: Task<Void, Never>?
+    /// Bumped whenever the presentation context is torn down (phase clear, back-navigation,
+    /// teardown), so a deferred prompt completion or re-arm task from the old context no-ops.
+    private var presentationEpoch = 0
 
     private var isTrialPhase: Bool {
         switch phase {
@@ -188,11 +191,17 @@ final class MyopiaScreenCoordinator: ObservableObject {
             MainActor.assumeIsolated {
                 guard let self, event == .finished, self.pendingListenAfterSpeech else { return }
                 self.pendingListenAfterSpeech = false
+                let epoch = self.presentationEpoch
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     let delay = self.config.listenResumeAfterSpeechSeconds
                     try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                    guard !self.isPausedForDistance, self.currentStimulus != nil else { return }
+                    // Re-arm only the exact deferred state this task was spawned for: same
+                    // presentation context, still waiting on speech, letter still up.
+                    guard epoch == self.presentationEpoch,
+                          self.listeningStatus == .speaking,
+                          !self.isPausedForDistance,
+                          self.currentStimulus != nil else { return }
                     self.listen()
                 }
             }
@@ -206,9 +215,9 @@ final class MyopiaScreenCoordinator: ObservableObject {
     private func handleCaptureEvent(_ event: CaptureEvent) {
         switch event {
         case .captureStarted:
-            // The engine applied .playAndRecord: the announcer's next utterance needs a real
-            // category switch + settle.
-            announcer.noteMicrophoneCaptureActive()
+            // The engine applied .playAndRecord and OWNS the session now: the announcer must
+            // speak under it rather than flipping to .playback (which would silence the tap).
+            announcer.setMicrophoneCaptureActive(true)
         case .interruptionBegan:
             cancelRecognition()
         case .interruptionEnded, .routeChanged:
@@ -228,7 +237,7 @@ final class MyopiaScreenCoordinator: ObservableObject {
 
     /// Called when the setup screen's checks all pass.
     ///
-    /// Provider callbacks (`onSample`, recognition completion) are contractually delivered on the
+    /// Provider callbacks (`onUpdate`, recognition completion) are contractually delivered on the
     /// main thread, so we hop straight onto the main actor with `assumeIsolated` rather than a
     /// deferred `Task`. This keeps the flow synchronous and deterministic for tests.
     /// Nil when the display can hold the protocol's worst-case optotype (or calibration is still
@@ -256,6 +265,9 @@ final class MyopiaScreenCoordinator: ObservableObject {
               let square = try? config.optotypeSquareSide(
                   calibration: cal, screenShortSidePoints: screenShortSidePoints) else { return }
         if startInManualMode {
+            // Register stickiness in the policy too, or the first resolved letter's
+            // inputMode recomputation would silently revert to voice.
+            retryPolicy.forceStickyManual()
             inputMode = .manualFallback(sticky: true)
         }
         sessionCalibration = cal
@@ -276,10 +288,13 @@ final class MyopiaScreenCoordinator: ObservableObject {
 
     /// Restores brightness and stops providers. Call on disappear, abort, or backgrounding.
     func teardown() {
+        presentationEpoch &+= 1
+        pendingListenAfterSpeech = false
         distance.stop()
         speech.cancel()
         capture?.endCaptureSession()
         fallback.cancel()
+        announcer.setMicrophoneCaptureActive(false)
         announcer.stop()
         brightness.restore()
     }
@@ -296,10 +311,12 @@ final class MyopiaScreenCoordinator: ObservableObject {
     /// brightness. ARKit interrupts its own session on background; the provider's interruption
     /// handling covers the session side.
     func handleBackground() {
+        presentationEpoch &+= 1
+        pendingListenAfterSpeech = false
         cancelRecognition()
         capture?.endCaptureSession()
+        announcer.setMicrophoneCaptureActive(false)
         announcer.stop()
-        pendingListenAfterSpeech = false
         switch phase {
         case .warmup, .highContrastGate, .lowContrast:
             isPausedForDistance = true
@@ -341,6 +358,8 @@ final class MyopiaScreenCoordinator: ObservableObject {
         case .distanceLock:
             resetRunStateForBack()
             distance.stop()
+            capture?.endCaptureSession()
+            announcer.setMicrophoneCaptureActive(false)
             currentStimulus = nil
             phase = .setup
             return true
@@ -396,9 +415,12 @@ final class MyopiaScreenCoordinator: ObservableObject {
     /// next phase starts clean. Unlike ``resetRunStateForBack()`` this keeps the session record,
     /// used when skipping FORWARD, where earlier results should be preserved.
     private func clearTrialRunState() {
+        // Invalidate deferred work FIRST: announcer.stop() below fires any pending prompt
+        // completion synchronously, and it must find a dead context.
+        presentationEpoch &+= 1
+        pendingListenAfterSpeech = false
         cancelRecognition()
         announcer.stop()
-        pendingListenAfterSpeech = false
         okDismissTask?.cancel()
         guidance = .hidden
         isPausedForDistance = false
@@ -415,6 +437,12 @@ final class MyopiaScreenCoordinator: ObservableObject {
     /// re-run starts clean. Does not touch the brightness lock or the distance provider lifecycle.
     private func resetRunStateForBack() {
         clearTrialRunState()
+        // A clean phase re-run also clears the alert and a NON-sticky keypad escalation; sticky
+        // manual mode was the clinician's explicit choice and survives.
+        serviceAlert = nil
+        if case .manualFallback(sticky: false) = inputMode {
+            inputMode = .voice
+        }
         mutableSession.trials.removeAll()
         mutableSession.highContrast = nil
         mutableSession.lowContrastRed = nil
@@ -425,9 +453,11 @@ final class MyopiaScreenCoordinator: ObservableObject {
         lowContrastResults = [:]
     }
 
-    /// Re-enters the distance-lock phase. `onSample` is already wired and brightness already locked
+    /// Re-enters the distance-lock phase. `onUpdate` is already wired and brightness already locked
     /// from the initial `beginAfterSetup()`, so we only restart the provider and stability window.
     private func restartDistanceLock() {
+        capture?.endCaptureSession()
+        announcer.setMicrophoneCaptureActive(false)
         distance.stop()
         distance.start()
         stability.reset()
@@ -467,7 +497,7 @@ final class MyopiaScreenCoordinator: ObservableObject {
                           bandGate.isWithinResumeBand(distanceCM: sample.distanceCM) {
                     resumeFromDistancePause()
                 } else if isPausedForDistance {
-                    updateGuidance(for: status)
+                    updateGuidance(for: status, pausedDistanceCM: sample.distanceCM)
                 } else {
                     // In band and running: track the live distance, half-pixel damped.
                     resizeVisibleStimulus(distanceCM: sample.distanceCM)
@@ -485,9 +515,13 @@ final class MyopiaScreenCoordinator: ObservableObject {
     }
 
     /// Pauses the active presentation because distance can no longer be trusted (out of band,
-    /// face lost, session interrupted/failed, or stale). The in-flight answer is invalidated.
+    /// face lost, session interrupted/failed, or stale). The in-flight answer is invalidated
+    /// and the letter is HIDDEN — a child who walks up to the phone must never get to read the
+    /// letter that will be re-presented after re-lock (gold-standard rule).
     private func pauseForDistance(status: DistanceStatus) {
         isPausedForDistance = true
+        currentStimulus = nil
+        currentSizingDistanceCM = nil
         cancelRecognition()
         updateGuidance(for: status)
     }
@@ -503,9 +537,18 @@ final class MyopiaScreenCoordinator: ObservableObject {
 
     /// Maps the evaluated status onto the guidance pill and (throttled) spoken direction. A child
     /// at 2 m cannot read small on-screen text, so directional guidance is spoken as well.
-    private func updateGuidance(for status: DistanceStatus) {
+    ///
+    /// `pausedDistanceCM` guards against a hysteresis live-lock: a paused child parked INSIDE
+    /// the valid band but OUTSIDE the resume band would dwell-lock and still not resume — "hold
+    /// still" forever. They get directional guidance toward the resume band instead.
+    private func updateGuidance(for status: DistanceStatus, pausedDistanceCM: Double? = nil) {
         okDismissTask?.cancel()
-        switch status {
+        var effective = status
+        if status == .holdSteady || status == .locked,
+           let cm = pausedDistanceCM, !bandGate.isWithinResumeBand(distanceCM: cm) {
+            effective = cm < bandGate.resumeBand.lowerBound ? .tooClose : .tooFar
+        }
+        switch effective {
         case .tooFar:
             guidance = .moveCloser
         case .tooClose:
@@ -515,7 +558,7 @@ final class MyopiaScreenCoordinator: ObservableObject {
         case .holdSteady, .locked:
             guidance = .holdSteady
         }
-        speakGuidanceIfNeeded(for: status)
+        speakGuidanceIfNeeded(for: effective)
     }
 
     private func speakGuidanceIfNeeded(for status: DistanceStatus) {
@@ -553,9 +596,12 @@ final class MyopiaScreenCoordinator: ObservableObject {
         phase = .warmup
         warmupCompleted = 0
         retryPolicy.beginTrial()
-        capture?.beginCaptureSession()
+        if inputMode == .voice {
+            capture?.beginCaptureSession()
+        }
+        let epoch = presentationEpoch
         announcer.speak(.warmupIntro) { [weak self] in
-            guard let self, self.phase == .warmup else { return }
+            guard let self, self.phase == .warmup, epoch == self.presentationEpoch else { return }
             self.presentWarmupLetter()
         }
     }
@@ -620,8 +666,9 @@ final class MyopiaScreenCoordinator: ObservableObject {
             phase = .highContrastGate
             // Spoken once as scoring begins; the low-contrast conditions continue silently.
             let expected = phase
+            let epoch = presentationEpoch
             announcer.speak(.testBegins) { [weak self] in
-                guard let self, self.phase == expected else { return }
+                guard let self, self.phase == expected, epoch == self.presentationEpoch else { return }
                 self.presentTrial()
             }
         case .lowContrastRed, .lowContrastGreen:
@@ -801,6 +848,7 @@ final class MyopiaScreenCoordinator: ObservableObject {
     private func escalateCurrentPresentation() {
         cancelRecognition()
         capture?.endCaptureSession()
+        announcer.setMicrophoneCaptureActive(false)
         inputMode = .manualFallback(sticky: retryPolicy.isStickyManual)
         listeningStatus = .escalatedToClinician
         repeatCurrentPresentation()
@@ -907,8 +955,12 @@ final class MyopiaScreenCoordinator: ObservableObject {
 
     private func completeSession() {
         mutableSession.completedAt = Date()
+        presentationEpoch &+= 1
         currentStimulus = nil
         cancelRecognition()
+        // The microphone must not stay hot on the results screen.
+        capture?.endCaptureSession()
+        announcer.setMicrophoneCaptureActive(false)
         distance.stop()
         brightness.restore()
         _ = try? store.save(mutableSession)

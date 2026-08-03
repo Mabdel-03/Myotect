@@ -24,6 +24,12 @@ live.
 6. Sloan optotype font loaded
 7. Display fits the protocol's worst-case letter
 
+If the **voice** path alone is blocked — microphone denied, or the speech model failed to load —
+but every sizing prerequisite is met, setup offers **"Continue with clinician keypad"**, which
+starts the session in sticky manual mode. Calibration, the optotype font, display fit, camera, and
+face tracking remain hard requirements: the keypad substitutes for the microphone, never for
+correct sizing or distance measurement.
+
 ## 2. Distance lock
 
 The child is guided to the target distance. Lock requires the measured distance to remain inside the
@@ -169,6 +175,10 @@ A trial that produces no usable answer must never re-present forever.
 - After enough consecutive escalations, manual mode is sticky until the clinician explicitly
   restores voice input.
 - A distance-pause repeat is **not** an answer attempt and does not consume or reset retries.
+- A **keypad-only start** (`forceStickyManual`) latches manual mode from the first trial and
+  survives resolved letters, so a session begun without a usable microphone never drifts back to
+  voice on its own.
+- `goBack()` clears non-sticky escalation state so a re-run starts clean.
 
 Keypad answers score exactly like voice answers; "couldn't answer" records an incorrect trial rather
 than silently skipping. Escalation during warm-up records nothing but still advances.

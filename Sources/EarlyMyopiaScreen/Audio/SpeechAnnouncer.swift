@@ -35,9 +35,11 @@ protocol PatientAudioPrompting: AnyObject {
     /// Speaks, superseding any in-flight utterance (whose completion fires exactly once).
     func speak(_ prompt: SpokenPrompt, completion: (() -> Void)?)
     func stop()
-    /// The recognition side calls this after WhisperKit reconfigures the session
-    /// (`.playAndRecord`), so the next `speak` knows a real category switch + settle is needed.
-    func noteMicrophoneCaptureActive()
+    /// While a live capture engine holds the audio session (`.playAndRecord`), the announcer
+    /// must NOT flip the category to `.playback` — that silences the microphone tap under the
+    /// running engine and kills recognition for the rest of the block. Speech then plays under
+    /// the capture session (`.defaultToSpeaker` keeps it audible).
+    func setMicrophoneCaptureActive(_ active: Bool)
 }
 
 extension PatientAudioPrompting {
@@ -55,13 +57,18 @@ final class SpeechAnnouncer: NSObject, ObservableObject, PatientAudioPrompting {
     private let rate: Float
     private let settleSeconds: TimeInterval
 
-    /// Category we know the session to be in; nil when unknown (e.g. after mic capture).
+    /// Category we know the session to be in; nil when unknown.
     private var knownCategory: AVAudioSession.Category?
+    /// True while a live capture engine owns the audio session: never flip categories then.
+    private var microphoneCaptureActive = false
     /// Covers the deferred pre-speech window (gold's `isPendingSpeech`).
     private var isPendingSpeech = false
     /// Bumped by `stop()`/supersession so a deferred utterance no-ops.
     private var generation = 0
     private var activeCompletion: (() -> Void)?
+    /// Identity of the utterance we are currently speaking; a stale delegate callback for a
+    /// superseded utterance must never touch the new one's state.
+    private var activeUtterance: AVSpeechUtterance?
 
     private let eventsSubject = PassthroughSubject<SpeechEvent, Never>()
     var events: AnyPublisher<SpeechEvent, Never> { eventsSubject.eraseToAnyPublisher() }
@@ -89,7 +96,12 @@ final class SpeechAnnouncer: NSObject, ObservableObject, PatientAudioPrompting {
         isPendingSpeech = true
         activeCompletion = completion
 
-        if knownCategory != .playback {
+        if microphoneCaptureActive {
+            // A live capture engine owns the session: speak under it without any category
+            // change — a .playback flip would silence the microphone tap and kill recognition
+            // for the rest of the listening block.
+            speakNow(prompt)
+        } else if knownCategory != .playback {
             configurePlaybackSession()
             knownCategory = .playback
             // Give the route a moment to settle so the utterance onset is not clipped
@@ -108,8 +120,12 @@ final class SpeechAnnouncer: NSObject, ObservableObject, PatientAudioPrompting {
         cancelInFlight()
     }
 
-    func noteMicrophoneCaptureActive() {
-        knownCategory = nil
+    func setMicrophoneCaptureActive(_ active: Bool) {
+        microphoneCaptureActive = active
+        if active {
+            // WhisperKit applied .playAndRecord; our cached category is no longer true.
+            knownCategory = nil
+        }
     }
 
     // MARK: - Internals
@@ -118,6 +134,7 @@ final class SpeechAnnouncer: NSObject, ObservableObject, PatientAudioPrompting {
         let utterance = AVSpeechUtterance(string: prompt.text)
         utterance.rate = rate
         utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+        activeUtterance = utterance
         synthesizer.speak(utterance)
     }
 
@@ -126,6 +143,9 @@ final class SpeechAnnouncer: NSObject, ObservableObject, PatientAudioPrompting {
         generation &+= 1
         let hadWork = isPendingSpeech || synthesizer.isSpeaking
         isPendingSpeech = false
+        // Detach identity FIRST: the stopSpeaking below emits a didCancel for the old utterance
+        // on a later main-queue turn, which must find nothing to touch.
+        activeUtterance = nil
         let completion = activeCompletion
         activeCompletion = nil
         if synthesizer.isSpeaking {
@@ -143,12 +163,18 @@ final class SpeechAnnouncer: NSObject, ObservableObject, PatientAudioPrompting {
         try? session.setActive(true, options: .notifyOthersOnDeactivation)
     }
 
-    private func utteranceDidStart() {
+    /// Delegate callbacks act only on the CURRENT utterance: a stale didStart/didFinish/didCancel
+    /// from a superseded one (they arrive a main-queue turn late) must never clear the pending
+    /// flag or fire the new utterance's completion.
+    private func utteranceDidStart(_ utterance: AVSpeechUtterance) {
+        guard utterance === activeUtterance else { return }
         isPendingSpeech = false
         eventsSubject.send(.started)
     }
 
-    private func utteranceDidEnd() {
+    private func utteranceDidEnd(_ utterance: AVSpeechUtterance) {
+        guard utterance === activeUtterance else { return }
+        activeUtterance = nil
         isPendingSpeech = false
         let completion = activeCompletion
         activeCompletion = nil
@@ -161,21 +187,21 @@ extension SpeechAnnouncer: AVSpeechSynthesizerDelegate {
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
                                        didStart utterance: AVSpeechUtterance) {
         DispatchQueue.main.async { [weak self] in
-            MainActor.assumeIsolated { self?.utteranceDidStart() }
+            MainActor.assumeIsolated { self?.utteranceDidStart(utterance) }
         }
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
                                        didFinish utterance: AVSpeechUtterance) {
         DispatchQueue.main.async { [weak self] in
-            MainActor.assumeIsolated { self?.utteranceDidEnd() }
+            MainActor.assumeIsolated { self?.utteranceDidEnd(utterance) }
         }
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer,
                                        didCancel utterance: AVSpeechUtterance) {
         DispatchQueue.main.async { [weak self] in
-            MainActor.assumeIsolated { self?.utteranceDidEnd() }
+            MainActor.assumeIsolated { self?.utteranceDidEnd(utterance) }
         }
     }
 }
@@ -198,7 +224,7 @@ final class SilentAnnouncer: PatientAudioPrompting {
 
     func stop() {}
 
-    func noteMicrophoneCaptureActive() {}
+    func setMicrophoneCaptureActive(_ active: Bool) {}
 
     /// Test hook: emit an event as the real announcer would.
     func send(_ event: SpeechEvent) { eventsSubject.send(event) }

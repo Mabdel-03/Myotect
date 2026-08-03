@@ -56,7 +56,7 @@ private final class MockAnnouncer: PatientAudioPrompting {
         completion?()
     }
     func stop() {}
-    func noteMicrophoneCaptureActive() {}
+    func setMicrophoneCaptureActive(_ active: Bool) {}
     func finishSpeaking() {
         isSpeaking = false
         subject.send(.finished)

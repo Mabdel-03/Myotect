@@ -198,6 +198,41 @@ final class CoordinatorRetryTests: XCTestCase {
         XCTAssertFalse(fallback.isAwaitingInput)
     }
 
+    func testKeypadOnlyStartStaysStickyAcrossResolvedLetters() {
+        let (coordinator, distance, speech, fallback) = makeCoordinator()
+        coordinator.beginAfterSetup(startInManualMode: true)
+        XCTAssertEqual(coordinator.inputMode, .manualFallback(sticky: true))
+        lockDistance(distance)
+        XCTAssertEqual(coordinator.phase, .warmup)
+
+        // Every presentation arms the keypad, never the microphone, and a resolved letter must
+        // NOT silently revert to voice.
+        XCTAssertTrue(fallback.isAwaitingInput)
+        XCTAssertFalse(speech.hasPending)
+        coordinator.submitManual(letter: coordinator.currentStimulus?.letter ?? "C")
+        XCTAssertEqual(coordinator.warmupCompleted, 1)
+        XCTAssertEqual(coordinator.inputMode, .manualFallback(sticky: true))
+        XCTAssertTrue(fallback.isAwaitingInput)
+        XCTAssertFalse(speech.hasPending)
+    }
+
+    func testGoBackClearsNonStickyEscalationForCleanRerun() {
+        let (coordinator, _, speech, fallback) = reachGate()
+        speech.answer(.unrecognized(.silence))
+        speech.answer(.unrecognized(.silence))
+        speech.answer(.unrecognized(.silence))
+        XCTAssertEqual(coordinator.inputMode, .manualFallback(sticky: false))
+        XCTAssertTrue(fallback.isAwaitingInput)
+
+        // A clean re-run of the previous phase must not inherit a non-sticky escalation.
+        XCTAssertTrue(coordinator.goBack())
+        XCTAssertEqual(coordinator.phase, .warmup)
+        XCTAssertEqual(coordinator.inputMode, .voice)
+        XCTAssertNil(coordinator.serviceAlert)
+        XCTAssertTrue(speech.hasPending)
+        XCTAssertFalse(fallback.isAwaitingInput)
+    }
+
     func testWarmupEscalationScoresNothingAndKeypadAdvancesWarmup() {
         let (coordinator, distance, speech, fallback) = makeCoordinator()
         coordinator.beginAfterSetup()

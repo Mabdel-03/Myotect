@@ -201,9 +201,11 @@ final class CoordinatorGateTests: XCTestCase {
         let firstLetter = coordinator.currentStimulus?.letter
         let firstAcuity = coordinator.currentStimulus?.acuityDenominator
 
-        // In the plausible range but outside the valid band: pauses via the band gate.
+        // In the plausible range but outside the valid band: pauses via the band gate, and the
+        // letter is HIDDEN so a child walking up cannot read the re-presented stimulus.
         distance.pushDistance(170, timestamp: 5.0)
         XCTAssertTrue(coordinator.isPausedForDistance)
+        XCTAssertNil(coordinator.currentStimulus)
         XCTAssertFalse(speech.hasPending)
 
         lockDistance(distance, start: 5.1)
@@ -226,9 +228,11 @@ final class CoordinatorGateTests: XCTestCase {
         let firstAcuity = coordinator.currentStimulus?.acuityDenominator
         let trialsBefore = coordinator.currentSessionSnapshot.trials.count
 
-        // An implausible reading is reported as out-of-range, which pauses and cancels recognition.
+        // An implausible reading is reported as out-of-range, which pauses (hiding the letter)
+        // and cancels recognition.
         distance.push(.outOfRange(rawCM: 50))
         XCTAssertTrue(coordinator.isPausedForDistance)
+        XCTAssertNil(coordinator.currentStimulus)
         XCTAssertFalse(speech.hasPending)
 
         lockDistance(distance, start: 5.1)
@@ -282,6 +286,10 @@ final class CoordinatorGateTests: XCTestCase {
         // band (183-237): hysteresis keeps the trial paused so the edge cannot chatter.
         lockDistance(distance, at: 181, start: 6)
         XCTAssertTrue(coordinator.isPausedForDistance)
+
+        // Parked at 181 the child is stable but cannot resume; "hold still" would live-lock, so
+        // the guidance must be directional (181 < resume band → move farther away).
+        XCTAssertEqual(coordinator.guidance, .moveFarther)
 
         // A dwell lock comfortably inside the resume band resumes.
         lockDistance(distance, at: 190, start: 8)

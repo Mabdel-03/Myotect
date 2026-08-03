@@ -34,6 +34,8 @@ setup → distanceLock → warmup → highContrastGate → lowContrast(×2) → 
 1. **Setup** — seven pre-flight checks must all pass before *Begin* is enabled: face tracking
    available, camera permission, microphone permission, speech model loaded, screen calibrated,
    Sloan font loaded, and the display physically large enough for the protocol's worst-case letter.
+   If only the *voice* path is blocked, a **"Continue with clinician keypad"** fallback starts the
+   session in manual mode; the sizing and distance prerequisites are never waivable.
 2. **Distance lock** — the child is guided to ~2 m. Locking requires the measured distance to stay
    inside **180–240 cm** for a continuous **0.75 s** window with a standard deviation ≤ **5 cm**.
 3. **Warm-up** — 5 unscored high-contrast letters at 20/80, so the child learns the task.
@@ -171,7 +173,7 @@ Myotect/
 │       └── Views/               ScreeningRootView + one view per phase, OptotypeView,
 │                                DistanceGuidancePill, ScreenCalibrationView, ResultsView,
 │                                PreviousResultsView
-└── Tests/                       170 XCTest unit tests across 18 files
+└── Tests/                       174 XCTest unit tests across 18 files
 ```
 
 Architecture is SwiftUI-first. ARKit/UIKit are isolated to the distance provider; all protocol logic
@@ -228,7 +230,7 @@ line.
 
 ## Status
 
-The unit suite is **green: 170 tests, 0 failures** (iPhone 16 Pro / iOS 18.2, ~0.6 s).
+The unit suite is **green: 174 tests, 0 failures** (iPhone 16 Pro / iOS 18.2, ~0.7 s).
 
 Behavior that still requires validation on physical hardware — ARKit distance stability at 2 m,
 audio-session coexistence between WhisperKit, the TTS announcer, and face tracking, and real
