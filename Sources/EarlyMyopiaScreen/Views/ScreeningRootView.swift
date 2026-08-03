@@ -1,0 +1,184 @@
+import ARKit
+import SwiftUI
+
+/// Root of the screening flow. Builds the coordinator with device-appropriate providers, switches
+/// on `coordinator.phase`, and restores brightness on background / disappear.
+struct ScreeningRootView: View {
+    @StateObject private var coordinator: MyopiaScreenCoordinator
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.dismiss) private var dismiss
+
+    private let clinician: ManualClinicianService?
+    private let whisperService: WhisperKitLetterRecognitionService?
+    private let calibrationProvider: ScreenCalibrationProviding
+    private let usingMocks: Bool
+
+    init() {
+        let config = ScreenConfig()
+        // Calibration owns the pixels→points→millimeters conversion (built on nativeScale, so
+        // downsampled Plus-class displays size correctly). DevicePpi resolves in the simulator
+        // too, so the real provider serves both branches; unknown devices go through the manual
+        // ruler flow gated in setup.
+        let calibration = ScreenCalibrationProvider()
+        let shortSide = Double(min(UIScreen.main.bounds.width, UIScreen.main.bounds.height))
+        calibrationProvider = calibration
+
+        // Real ARKit + WhisperKit voice on supported hardware; mocks otherwise (simulator / unsupported).
+        // The distance provider is headless and coordinator-owned: it runs from beginAfterSetup()
+        // to teardown(), so live distance keeps flowing through warm-up and every trial.
+        // The clinician keypad is always wired: it is the escalation target when voice input
+        // fails repeatedly, and the sticky-manual fallback for a dead microphone.
+        let manual = ManualClinicianService()
+
+        let announcer = SpeechAnnouncer(config: config)
+
+        if ARFaceTrackingConfiguration.isSupported {
+            let ar = ARKitDistanceProvider(config: config)
+            let speech = WhisperKitLetterRecognitionService()
+            _coordinator = StateObject(wrappedValue: MyopiaScreenCoordinator(
+                config: config, distance: ar, speech: speech, fallback: manual,
+                announcer: announcer,
+                calibration: calibration, screenShortSidePoints: shortSide))
+            clinician = manual
+            whisperService = speech
+            usingMocks = false
+        } else {
+            let mock = MockDistanceProvider(steadyDistanceCM: config.targetDistanceCM, config: config)
+            let mockSpeech = MockLetterRecognitionService()
+            let coord = MyopiaScreenCoordinator(
+                config: config, distance: mock, speech: mockSpeech, fallback: manual,
+                announcer: announcer,
+                calibration: calibration, screenShortSidePoints: shortSide)
+            // In the simulator, answer correctly for whatever letter is shown so the flow runs.
+            mockSpeech.setCorrectLetterProvider { [weak coord] in coord?.currentStimulus?.letter }
+            _coordinator = StateObject(wrappedValue: coord)
+            clinician = manual
+            whisperService = nil
+            usingMocks = true
+        }
+    }
+
+    var body: some View {
+        content
+            .overlay(alignment: .topLeading) { backButton }
+            .overlay(alignment: .topTrailing) { nextButton }
+            .onChange(of: scenePhase) { _, newPhase in
+                switch newPhase {
+                case .background: coordinator.handleBackground()
+                case .active: coordinator.handleForeground()
+                default: break
+                }
+            }
+            .onDisappear { coordinator.teardown() }
+            .alert("Voice input unavailable",
+                   isPresented: Binding(
+                       get: { coordinator.serviceAlert != nil },
+                       set: { if !$0 { coordinator.serviceAlert = nil } })) {
+                if case .microphonePermissionDenied = coordinator.serviceAlert {
+                    Button("Open Settings") {
+                        if let url = URL(string: UIApplication.openSettingsURLString) {
+                            UIApplication.shared.open(url)
+                        }
+                    }
+                }
+                Button("Use keypad", role: .cancel) {}
+            } message: {
+                Text(serviceAlertMessage)
+            }
+    }
+
+    private var serviceAlertMessage: String {
+        switch coordinator.serviceAlert {
+        case .microphonePermissionDenied:
+            return "Microphone access was turned off. The screening continues with the clinician keypad; enable the microphone in Settings to restore voice input."
+        case .modelUnavailable(let message):
+            return "The speech model is unavailable (\(message)). The screening continues with the clinician keypad."
+        case .audioCaptureFailed(let message):
+            return "Audio capture failed (\(message)). The screening continues with the clinician keypad."
+        case nil:
+            return ""
+        }
+    }
+
+    /// A single Back control shared across the in-flow screens. Restarts the previous phase; from
+    /// `.setup` (no predecessor) it dismisses the whole flow back to the main menu.
+    @ViewBuilder
+    private var backButton: some View {
+        if showsBackButton {
+            Button {
+                if !coordinator.goBack() { dismiss() }
+            } label: {
+                Label("Back", systemImage: "chevron.left")
+                    .padding(8)
+                    .background(.ultraThinMaterial, in: Capsule())
+            }
+            .padding()
+        }
+    }
+
+    /// A single Next control shared across the in-flow test screens. Skips the current test (no
+    /// result recorded) and advances to the start of the next phase. Not shown on `.setup`, where
+    /// the permission-gated "Begin" button handles the transition.
+    @ViewBuilder
+    private var nextButton: some View {
+        if showsNextButton {
+            Button {
+                coordinator.goNext()
+            } label: {
+                Label("Next", systemImage: "chevron.right")
+                    .labelStyle(.titleAndIcon)
+                    .padding(8)
+                    .background(.ultraThinMaterial, in: Capsule())
+            }
+            .padding()
+        }
+    }
+
+    private var showsBackButton: Bool {
+        switch coordinator.phase {
+        case .setup, .distanceLock, .warmup, .highContrastGate, .lowContrast:
+            return true
+        case .results, .aborted:
+            return false
+        }
+    }
+
+    private var showsNextButton: Bool {
+        switch coordinator.phase {
+        case .distanceLock, .warmup, .highContrastGate, .lowContrast:
+            return true
+        case .setup, .results, .aborted:
+            return false
+        }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch coordinator.phase {
+        case .setup:
+            SetupPermissionsView(coordinator: coordinator, usingMocks: usingMocks,
+                                 whisperService: whisperService,
+                                 calibrationProvider: calibrationProvider)
+        case .distanceLock:
+            DistanceLockView(coordinator: coordinator)
+        case .warmup:
+            WarmupView(coordinator: coordinator, clinician: clinician)
+        case .highContrastGate, .lowContrast:
+            AcuityTrialView(coordinator: coordinator, clinician: clinician)
+        case .results:
+            ResultsView(session: coordinator.session, onDone: { dismiss() })
+        case .aborted(let reason):
+            VStack(spacing: 16) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 64))
+                    .foregroundStyle(.orange)
+                Text("Screening stopped")
+                    .font(.title.bold())
+                Text(reason)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .padding()
+        }
+    }
+}

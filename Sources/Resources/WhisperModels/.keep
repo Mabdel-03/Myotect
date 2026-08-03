@@ -1,0 +1,5 @@
+Placeholder so the WhisperModels folder reference in project.yml resolves after a fresh clone.
+
+The openai_whisper-base CoreML model (~140 MB) is intentionally NOT tracked in git.
+Leave this directory empty to have WhisperKit download the model on first launch, or drop
+openai_whisper-base/ here to run fully offline. See docs/TESTING.md.

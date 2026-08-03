@@ -1,0 +1,28 @@
+# XcodeGen output
+Myotect.xcodeproj/
+
+# Xcode user and build state
+*.xcworkspace/xcuserdata/
+xcuserdata/
+DerivedData/
+build/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Bundled Whisper model weights (~140 MB; TextDecoder weight.bin alone is 99.3 MiB, which is
+# within a rounding error of GitHub's 100 MiB hard limit). Kept out of the repository exactly as
+# in the sibling VisualAcuityTest_ETDRS app. WhisperKitLetterRecognitionService prefers this
+# folder when present and otherwise falls back to WhisperKit.download(variant:) on first launch.
+# See docs/TESTING.md § "Speech model (WhisperKit)".
+Sources/Resources/WhisperModels/*
+!Sources/Resources/WhisperModels/.keep
+
+# macOS
+.DS_Store
