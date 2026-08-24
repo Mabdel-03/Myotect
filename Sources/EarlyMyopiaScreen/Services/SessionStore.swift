@@ -38,6 +38,25 @@ struct SessionStore {
         return try decoder.decode(MyopiaScreenSession.self, from: data)
     }
 
+    /// Deletes every saved session file (JSON and CSV). Irreversible — callers confirm first.
+    func deleteAllSessions() {
+        guard let dir = try? sessionsDirectory(),
+              let urls = try? fileManager.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+        else { return }
+        for url in urls {
+            try? fileManager.removeItem(at: url)
+        }
+    }
+
+    /// Writes the session's CSV to a temporary file for the share sheet. The temp directory is
+    /// system-managed, so cleanup is best-effort.
+    func temporaryCSVURL(for session: MyopiaScreenSession) throws -> URL {
+        let url = fileManager.temporaryDirectory
+            .appendingPathComponent("myotect_\(session.sessionID).csv")
+        try Data(csv(for: session).utf8).write(to: url)
+        return url
+    }
+
     /// Loads every saved session, newest first (by `completedAt ?? startedAt`). Unreadable or
     /// undecodable files are skipped so one bad file never hides the rest.
     func loadAllSessions() -> [MyopiaScreenSession] {
@@ -58,6 +77,10 @@ struct SessionStore {
             "trial_number", "timestamp",
             "sizing_version", "calibration_source", "points_per_mm", "screen_signature",
             "target_height_mm", "rendered_height_points",
+            // Session-level constant repeated per row: with contrast operator-selectable, every
+            // trial row must carry the Weber value that produced it. Appended last so columns
+            // 1-18 stay positionally stable for existing analysis scripts.
+            "weber_contrast",
         ].joined(separator: ",")
 
         let formatter = ISO8601DateFormatter()
@@ -83,6 +106,7 @@ struct SessionStore {
                 Self.csvField(trial.provenance?.screenSignature ?? ""),
                 trial.provenance.map { String(format: "%.3f", $0.targetHeightMillimeters) } ?? "",
                 trial.provenance.map { String(format: "%.2f", $0.renderedHeightPoints) } ?? "",
+                String(format: "%.2f", session.weberContrast),
             ].joined(separator: ",")
         }
 

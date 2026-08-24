@@ -1,5 +1,24 @@
 import Foundation
 
+/// The staircase protocol parameters in force for a session, persisted alongside the trials so a
+/// recorded response can always be interpreted against the exact protocol that produced it
+/// (analog of the gold app's `TestProtocolMetadata`).
+struct StaircaseProtocolMetadata: Codable, Equatable {
+    let trialsPerLevel: Int
+    let advanceThreshold: Int
+    let earlySkipCount: Int
+    let lineLogMARIncrement: Double
+    let logMARPerLetter: Double
+
+    init(config: AcuityStaircaseConfig) {
+        trialsPerLevel = config.trialsPerLevel
+        advanceThreshold = config.advanceThreshold
+        earlySkipCount = config.earlySkipCount
+        lineLogMARIncrement = config.lineLogMARIncrement
+        logMARPerLetter = config.logMARPerLetter
+    }
+}
+
 /// One complete screening session record. Codable for JSON export.
 ///
 /// This is a research/screening artifact, not a diagnosis. No validated threshold is stored; the
@@ -37,6 +56,15 @@ struct MyopiaScreenSession: Codable, Equatable {
     /// The validated screen calibration in force when the session began. Optional so pre-upgrade
     /// session JSON still decodes.
     var calibration: ScreenCalibration? = nil
+
+    /// Mean of the readings across the operator-initiated capture hold — where the subject
+    /// actually locked, as distinct from the fixed `targetDistanceCM`. Optional so pre-upgrade
+    /// session JSON still decodes (and nil when the lock phase was skipped manually).
+    var lockedDistanceCM: Double? = nil
+
+    /// The staircase protocol parameters the session ran under. Optional so pre-upgrade session
+    /// JSON still decodes.
+    var staircaseProtocol: StaircaseProtocolMetadata? = nil
 
     /// Recomputes the duochrome delta from the two low-contrast results, if both are present.
     mutating func recomputeDelta() {

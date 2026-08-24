@@ -39,10 +39,12 @@ final class WhisperKitLetterRecognitionService: NSObject, ObservableObject, @Mai
         case failed(String)
     }
 
-    /// Load/compile phases surfaced as determinate-ish progress during setup (the model is
-    /// bundled, so there is no download phase).
+    /// Load/compile phases surfaced as determinate-ish progress during setup. The model is
+    /// normally bundled; `.downloading` covers the first-run fallback when it is not (progress
+    /// detail in ``downloadFraction``, so the operator never watches a frozen "locating model").
     enum ModelPrepPhase: Int, CaseIterable, Equatable {
         case locatingModel
+        case downloading
         case initializing
         case prewarming
         case loading
@@ -50,6 +52,7 @@ final class WhisperKitLetterRecognitionService: NSObject, ObservableObject, @Mai
         var label: String {
             switch self {
             case .locatingModel: return "locating model"
+            case .downloading: return "downloading model"
             case .initializing: return "initializing"
             case .prewarming: return "prewarming"
             case .loading: return "loading"
@@ -59,6 +62,7 @@ final class WhisperKitLetterRecognitionService: NSObject, ObservableObject, @Mai
         var fraction: Double {
             switch self {
             case .locatingModel: return 0.1
+            case .downloading: return 0.25
             case .initializing: return 0.35
             case .prewarming: return 0.6
             case .loading: return 0.85
@@ -67,6 +71,9 @@ final class WhisperKitLetterRecognitionService: NSObject, ObservableObject, @Mai
     }
 
     @Published private(set) var modelState: ModelState = .preparing(.locatingModel)
+    /// 0...1 progress of the model download, meaningful only while
+    /// `modelState == .preparing(.downloading)`.
+    @Published private(set) var downloadFraction: Double = 0
 
     /// The service can run on real hardware regardless of model-load progress; readiness is reported
     /// separately via ``modelState``. Used only for service *selection*, not per-trial gating.
@@ -158,7 +165,13 @@ final class WhisperKitLetterRecognitionService: NSObject, ObservableObject, @Mai
         if let bundledFolder = bundledModelFolderURL() {
             return try await initializeWhisperKit(model: nil, modelFolder: bundledFolder)
         }
-        let modelFolder = try await WhisperKit.download(variant: bundledModelVariant)
+        modelState = .preparing(.downloading)
+        downloadFraction = 0
+        let modelFolder = try await WhisperKit.download(variant: bundledModelVariant) { progress in
+            Task { @MainActor [weak self] in
+                self?.downloadFraction = progress.fractionCompleted
+            }
+        }
         return try await initializeWhisperKit(model: bundledModelVariant, modelFolder: modelFolder)
     }
 
@@ -191,7 +204,6 @@ final class WhisperKitLetterRecognitionService: NSObject, ObservableObject, @Mai
               isDirectory.boolValue else { return nil }
 
         let exactCandidates = [
-            root.appendingPathComponent("openai_whisper-\(bundledModelVariant)", isDirectory: true),
             root.appendingPathComponent(bundledModelVariant, isDirectory: true),
         ]
         for candidate in exactCandidates {
@@ -589,10 +601,13 @@ enum WhisperTranscriptFilter {
 
     /// Ignorable non-answers / silence markers, plus the "you"/"thank you"/"thanks for watching"
     /// family Whisper hallucinates on near-silent audio. All of these mean "heard nothing".
+    /// The space-free "blankaudio"/"silentaudio" forms cover Whisper's bracketed markers via the
+    /// compact-form check (gold parity).
     static let nonAnswerExact: Set<String> = [
         // Ignorable non-answers / silence markers
-        "blank", "blank audio", "empty", "no audio", "no speech", "no sound", "silence",
-        "silent", "silent audio", "pause", "noise", "music", "background noise", "background", "static",
+        "blank", "blank audio", "blankaudio", "empty", "no audio", "no speech", "no sound",
+        "silence", "silent", "silent audio", "silentaudio", "pause", "noise", "music",
+        "background noise", "background", "static",
         // Whisper silence hallucinations
         "you", "thank you", "thanks for watching", "thank you for watching", "bye", "the end",
     ]
@@ -600,14 +615,22 @@ enum WhisperTranscriptFilter {
     /// Classifies a whole transcript that must not reach the letter mapper: `.filler` for
     /// engaged-but-no-answer sounds, `.silence` for silence markers/hallucinations (and blank
     /// text). Returns nil when the transcript is a real answer candidate for the mapper.
+    ///
+    /// Normalization matches ``LetterMappingTable/normalize(_:)`` (non-letter runs become a
+    /// space), and — as in the gold filter — the space-stripped compact form is checked against
+    /// the sets too, so "[BLANK_AUDIO]" is caught however it collapses.
     static func nonAnswerKind(_ raw: String) -> NonAnswerKind? {
-        let normalized = raw.lowercased()
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .components(separatedBy: CharacterSet.punctuationCharacters).joined()
-            .trimmingCharacters(in: .whitespaces)
+        let normalized = LetterMappingTable.normalize(raw)
         if normalized.isEmpty { return .silence }
+        // The compact form is checked against the SILENCE markers only (gold rule). Never
+        // against fillers: "Er, R" compacts to "err" and "Uh, H" to "uhh" — collapsing a
+        // hesitation-plus-answer into a filler would discard a correct letter from exactly
+        // the hesitant children this flow serves.
+        let compact = normalized.replacingOccurrences(of: " ", with: "")
         if fillerExact.contains(normalized) { return .filler }
-        if nonAnswerExact.contains(normalized) { return .silence }
+        if nonAnswerExact.contains(normalized) || nonAnswerExact.contains(compact) {
+            return .silence
+        }
         // Token-wise: only reject when EVERY token is a known non-answer. Any filler token
         // means the child made a sound, so filler wins over silence markers in a mix.
         let tokens = normalized.split(separator: " ").map(String.init)

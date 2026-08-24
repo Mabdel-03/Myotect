@@ -30,21 +30,31 @@ starts the session in sticky manual mode. Calibration, the optotype font, displa
 face tracking remain hard requirements: the keypad substitutes for the microphone, never for
 correct sizing or distance measurement.
 
-## 2. Distance lock
+## 2. Distance lock (operator-initiated capture)
 
-The child is guided to the target distance. Lock requires the measured distance to remain inside the
-valid band for a continuous window with low variability.
+The child is guided to the target distance, and the OPERATOR decides when it is right — the
+gold-standard user-initiated capture flow. The Capture Distance button arms once a fresh reading
+sits inside the valid band; tapping it anchors a steady hold to the tap-instant reading. Any
+reading drifting beyond the tolerance from that anchor — or losing the face — voids the hold with
+a transient on-screen notice ("Moved too much — try again" / "Lost your face — try again") and a
+matching spoken prompt. Only hold completion advances to warm-up; the mean of every
+timestamp-deduped reading across the hold window is recorded on the session as `lockedDistanceCM`.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `targetDistanceCM` | 200 | Nominal test distance |
-| `validDistanceRangeCM` | 180…240 | Band required to lock and to keep a trial valid |
+| `validDistanceRangeCM` | 180…240 | Band required to arm Capture and to keep a trial valid. The 0.9× lower fraction deliberately tightens the reference app's 0.8× — a too-close child inflates measured acuity |
 | `providerDistanceRangeCM` | 100…300 | Wider band the provider accepts as *plausible* at all |
-| `distanceStableWindowSeconds` | 0.75 | Continuous in-band dwell required |
-| `maxDistanceSDCM` | 5 | Max standard deviation across the dwell window |
+| `holdDurationSeconds` | 2.0 | Steady hold after the Capture tap (whole-second countdown shown) |
+| `holdToleranceCM` | 4.0 | Max deviation from the tap-instant anchor before the hold voids |
+| `captureRetryNoticeSeconds` | 2.5 | How long a void notice stays up before clearing itself |
+| `distanceStableWindowSeconds` | 0.75 | Continuous in-band dwell — IN-TRIAL resume re-lock only |
+| `maxDistanceSDCM` | 5 | Max standard deviation across the dwell window (in-trial re-lock only) |
 
 Guidance strings: `noFace` → "I can't see you. Step into view." · `tooClose` → "Move farther away" ·
 `tooFar` → "Move closer" · `holdSteady` → "Hold still…" · `locked` → "Distance locked".
+On the lock screen the pill goes quiet once the subject is in band — the enabled Capture button
+speaks for itself.
 
 ### Sampling and validity
 
@@ -79,29 +89,39 @@ ambiguous or unrecognized re-presents.
 
 ## 4. Acuity staircase
 
+The staircase is the ETDRS five-letter protocol, ported from the reference app's authoritative
+`ETDRSProgressionEngine` (`etdrs-five-letter-v1`).
+
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `acuityLevels` | 200, 160, 125, 100, 80, 63, 50, 40, 32, 25, 20, 16 | Easiest → hardest |
 | `startAcuity` | 40 | Starting level |
-| `trialsPerLevel` | 10 | Trials before a pass/fail decision |
-| `advanceThreshold` | 6 | Minimum correct to advance |
-| `earlySkipCount` | 5 | All-correct run that passes the level immediately |
+| `trialsPerLevel` | 5 | Trials before a pass/fail decision (one ETDRS line) |
+| `advanceThreshold` | 3 | Minimum correct to advance |
+| `earlySkipCount` | 3 | All-correct run that passes the level immediately |
+| `lineLogMARIncrement` | 0.1 | logMAR per line; per-letter credit = 0.1 / 5 = **0.02** |
 | `gateAcuity` | 25 | Gate denominator (high contrast only) |
 
 **Rules**
 
-- ≥ 6 of 10 correct → advance to the next finer level.
-- First 5 all correct → pass immediately, recorded as a perfect 10/10.
+- ≥ 3 of 5 correct → advance to the next finer level.
+- First 3 all correct → pass immediately, recorded as a perfect 5/5 line.
 - Otherwise → step back to the next coarser level; if that level was already passed, the threshold
   lies between them and the staircase terminates.
-- Terminates at either end of the level list.
+- Advancing INTO a level that already has a result also terminates (the threshold is bracketed) —
+  a completed line is never re-tested or overwritten.
+- Completing the finest level terminates with that level as the score's base line, pass or fail.
+- Failing the largest level terminates, scored against the (possibly untested) second-largest.
 
-**Scoring.** `logMAR = table[finest passed level] + wrong / 100`, where the table is
+**Scoring (two terminal lines).** The threshold sits between the two *terminal* lines: the finer
+one — even when it was failed — is `primaryAcuity`; the coarser is `secondaryAcuity`.
+`logMAR = table[primaryAcuity] + (primaryMisses + secondaryMisses) × 0.02`, where the table is
 20/20 → 0.0, 20/25 → 0.1, 20/32 → 0.2, 20/40 → 0.3, 20/50 → 0.4, 20/63 → 0.5, 20/80 → 0.6,
 20/100 → 0.7, 20/125 → 0.8, 20/160 → 0.9, 20/200 → 1.0 (and 20/16 → −0.1, 20/12 → −0.2, 20/10 → −0.3).
 
-`reachedGate` is true when the finest passed level is 20/25 or finer. The low-contrast conditions run
-with `gateAcuity = nil`, so they are never gated.
+`reachedGate` is true when the finest PASSED level is 20/25 or finer — a failed primary line never
+opens the gate. The low-contrast conditions run with `gateAcuity = nil`, so they are never gated.
+The protocol parameters in force are persisted on every session as `staircaseProtocol`.
 
 ## 5. Conditions and contrast
 
@@ -113,12 +133,15 @@ with `gateAcuity = nil`, so they are never gated.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `lowContrastWeber` | 0.05 | 5 % Weber contrast |
-| `fallbackWeber` | 0.10 | If 5 % proves too difficult |
+| `lowContrastWeber` | 0.10 | 10 % Weber contrast — operator-selectable 5 / 10 / 15 % in Settings |
 | `backgroundBrightness` | 1.0 | Background channel value (0…1) |
 | `ContrastPalette.tealBlueFraction` | 1.0 | Blue mixed into the short-wavelength condition |
 
 Weber contrast: `stimulus = background × (1 − weber)`.
+
+The contrast setting is persisted by `ScreeningSettingsProvider` (UserDefaults), read once when
+the screening flow is launched, and immutable for the session; it is recorded on the session as
+`weberContrast` (JSON) and on every CSV trial row (`weber_contrast`).
 
 The teal condition keeps **red at exactly 0** so no long-wavelength light contaminates the
 short-wavelength stimulus — otherwise the duochrome comparison is meaningless. The case name
@@ -190,14 +213,14 @@ than silently skipping. Escalation during warm-up records nothing but still adva
 | `ttsEnabled` | `true` | Master switch for spoken prompts |
 | `ttsRate` | 0.5 | `AVSpeechUtterance` rate |
 | `categorySettleSeconds` | 0.15 | Settle delay after an audio-session category switch, so the utterance onset is not clipped |
-| `listenResumeAfterSpeechSeconds` | 1.0 | Delay before recognition resumes after speech ends |
+| `listenResumeAfterSpeechSeconds` | 1.5 | Delay before recognition resumes after speech ends (gold-standard value, keeps the prompt tail out of the capture window) |
 | `distancePromptMinIntervalSeconds` | 5 | Minimum gap before the *same* guidance prompt repeats |
 | `speakEveryTrialPrompt` | `false` | When false, the per-trial prompt is not repeated on every letter |
 
 The spoken catalog is closed (`SpokenPrompt`): "Say the letter you see.", "Say the letter you see out
 loud.", "Let's practice. Say each letter out loud.", "Here we go. Say the letter you see.", "Move
-closer.", "Move farther away.", "I can't see you. Step back into view.", "Hold still.", "All done.
-Great job!"
+closer.", "Move farther.", "I can't see you. Step back into view.", "Hold still.", "Moved too much.
+Please try again.", "Lost your face. Please try again.", "All done. Great job!"
 
 **Recognition never runs while the app is speaking** — the coordinator gates listening on
 `isSpeaking`, which deliberately covers the pre-speech category-switch window as well as the

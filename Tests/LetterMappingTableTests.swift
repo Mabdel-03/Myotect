@@ -28,6 +28,27 @@ final class LetterMappingTableTests: XCTestCase {
         XCTAssertNil(LetterMappingTable.letter(forTranscript: "banana"))
     }
 
+    func testConversationalYesIsNotALetter() {
+        // "yes" must never score as S (gold leaves it unmapped): a child agreeing with the
+        // operator is not an answer.
+        XCTAssertNil(LetterMappingTable.letter(forTranscript: "yes"))
+        XCTAssertEqual(LetterMappingTable.classify("yes"), .unrecognized(.unintelligible))
+    }
+
+    func testNormalizationSpacesOutPunctuation() {
+        // Non-letter runs become a single space (gold `[^A-Z]+ → " "`), so punctuation-joined
+        // words stay separate tokens instead of fusing into unmappable blobs.
+        XCTAssertEqual(LetterMappingTable.normalize("C-D"), "c d")
+        XCTAssertEqual(LetterMappingTable.normalize("[BLANK_AUDIO]"), "blank audio")
+        XCTAssertEqual(LetterMappingTable.normalize("  See.  "), "see")
+    }
+
+    func testPunctuationJoinedLettersClassifyAsAmbiguous() {
+        // "C-D" is an answer plus a correction: two distinct letters → ambiguous → the trial
+        // repeats. (Fusing to "cd" used to burn a retry as unintelligible.)
+        XCTAssertEqual(LetterMappingTable.classify("C-D"), .ambiguous)
+    }
+
     func testClassifySingleLetter() {
         XCTAssertEqual(LetterMappingTable.classify("see"), .letter("C"))
     }

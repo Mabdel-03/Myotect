@@ -11,6 +11,10 @@ private final class ManualDistanceProvider: DistanceProvider {
     private(set) var latestSample: DistanceSample?
     /// When set, `validity(maximumAge:now:)` answers this instead of the last pushed value.
     var validityOverride: DistanceValidity?
+    /// Taps Capture Distance on the coordinator (wired by `makeCoordinator`), so the shared
+    /// `lockDistance` helper can drive the operator-initiated hold without every call site
+    /// needing the coordinator. A no-op outside the distance-lock phase.
+    var captureHook: (() -> Void)?
 
     private var lastValidity: DistanceValidity = .missing
 
@@ -66,28 +70,34 @@ final class CoordinatorGateTests: XCTestCase {
             schemaVersion: ScreenCalibration.schemaVersion)
     }
 
-    private func makeCoordinator(order: [ColorCondition]? = nil,
+    private func makeCoordinator(config: ScreenConfig = ScreenConfig(),
+                                 order: [ColorCondition]? = nil,
                                  calibration: ScreenCalibrationProviding? = nil,
                                  screenShortSidePoints: Double = 393)
         -> (MyopiaScreenCoordinator, ManualDistanceProvider, ScriptedSpeechService) {
         let distance = ManualDistanceProvider()
         let speech = ScriptedSpeechService()
         let coordinator = MyopiaScreenCoordinator(
-            config: ScreenConfig(),
+            config: config,
             distance: distance,
             speech: speech,
             calibration: calibration
                 ?? StaticScreenCalibrationProvider(calibration: Self.testCalibration()),
             screenShortSidePoints: screenShortSidePoints,
             lowContrastOrderOverride: order)
+        distance.captureHook = { [weak coordinator] in coordinator?.beginDistanceCapture() }
         return (coordinator, distance, speech)
     }
 
-    /// Pushes locked samples to satisfy the stability window and advance to warm-up.
+    /// Drives a full distance lock: one in-band sample enables Capture, the hook taps it, and
+    /// 2.1 s of steady samples completes the hold → warm-up. In trial phases the tap is a no-op
+    /// and the same steady samples satisfy the in-trial dwell re-lock instead.
     private func lockDistance(_ distance: ManualDistanceProvider,
                               at cm: Double = 200,
                               start: TimeInterval = 0) {
-        for i in 0...10 {
+        distance.pushDistance(cm, timestamp: start)
+        distance.captureHook?()
+        for i in 1...21 {
             distance.pushDistance(cm, timestamp: start + Double(i) * 0.1)
         }
     }
@@ -127,6 +137,146 @@ final class CoordinatorGateTests: XCTestCase {
         coordinator.beginAfterSetup()
         XCTAssertEqual(coordinator.phase, .distanceLock)
         lockDistance(distance)
+        XCTAssertEqual(coordinator.phase, .warmup)
+        // The capture records where the subject actually held (mean of the steady window).
+        XCTAssertEqual(coordinator.currentSessionSnapshot.lockedDistanceCM ?? -1, 200,
+                       accuracy: 0.0001)
+    }
+
+    // MARK: - Operator-initiated capture (gold 2 s steady hold)
+
+    func testValidSamplesAloneNeverAdvancePastDistanceLock() {
+        // Architecture guard for the user-initiated flow: however long the subject stands
+        // steadily in band, nothing advances until the operator taps Capture and the hold
+        // completes.
+        let (coordinator, distance, _) = makeCoordinator()
+        coordinator.beginAfterSetup()
+        for i in 0...40 {
+            distance.pushDistance(200, timestamp: Double(i) * 0.1)
+        }
+        XCTAssertEqual(coordinator.phase, .distanceLock)
+        XCTAssertEqual(coordinator.captureState, .ready)
+        XCTAssertNil(coordinator.currentSessionSnapshot.lockedDistanceCM)
+    }
+
+    func testCaptureNotReadyOutOfBandAndTapRefused() {
+        // 170 cm is plausible (provider accepts it) but outside the 180–240 valid band: the
+        // Capture button must not arm, and a stray tap must not start a hold.
+        let (coordinator, distance, _) = makeCoordinator()
+        coordinator.beginAfterSetup()
+        distance.pushDistance(170, timestamp: 0)
+        XCTAssertEqual(coordinator.captureState, .waitingForSubject)
+        coordinator.beginDistanceCapture()
+        for i in 1...25 {
+            distance.pushDistance(170, timestamp: Double(i) * 0.1)
+        }
+        XCTAssertEqual(coordinator.phase, .distanceLock)
+    }
+
+    func testHoldVoidsOnDriftWithRetryNoticeThenRecaptures() {
+        let (coordinator, distance, _) = makeCoordinator()
+        coordinator.beginAfterSetup()
+        distance.pushDistance(200, timestamp: 0)
+        XCTAssertEqual(coordinator.captureState, .ready)
+        coordinator.beginDistanceCapture()
+
+        // Drifting more than the 4 cm tolerance from the tap-instant anchor voids the hold.
+        distance.pushDistance(203, timestamp: 0.5)
+        distance.pushDistance(205, timestamp: 1.0)
+        XCTAssertEqual(coordinator.phase, .distanceLock)
+        XCTAssertEqual(coordinator.captureRetryNotice, "Moved too much — try again")
+        XCTAssertEqual(coordinator.captureState, .ready)
+        XCTAssertNil(coordinator.currentSessionSnapshot.lockedDistanceCM)
+
+        // A fresh tap and steady hold still captures.
+        lockDistance(distance, start: 2)
+        XCTAssertEqual(coordinator.phase, .warmup)
+    }
+
+    func testHoldVoidsOnFaceLoss() {
+        let (coordinator, distance, _) = makeCoordinator()
+        coordinator.beginAfterSetup()
+        distance.pushDistance(200, timestamp: 0)
+        coordinator.beginDistanceCapture()
+        distance.pushDistance(201, timestamp: 0.5)
+
+        distance.push(.missing)
+        XCTAssertEqual(coordinator.phase, .distanceLock)
+        XCTAssertEqual(coordinator.captureRetryNotice, "Lost your face — try again")
+        XCTAssertEqual(coordinator.captureState, .waitingForSubject)
+    }
+
+    func testHoldWithinToleranceCapturesMeanOfWindow() {
+        // Readings drift inside the ±4 cm envelope, BIASED above the anchor so the expected
+        // value differs from the tap-instant anchor (204), from targetDistanceCM (200), and
+        // from any partial window — only the true deduped mean of the whole hold passes.
+        let (coordinator, distance, _) = makeCoordinator()
+        coordinator.beginAfterSetup()
+        distance.pushDistance(204, timestamp: 0)
+        coordinator.beginDistanceCapture()
+        var pushed: [Double] = [204]
+        // The hold completes exactly at the 2.0 s mark (the 20th push).
+        for i in 1...20 {
+            let cm = i.isMultiple(of: 2) ? 207.0 : 205.0
+            pushed.append(cm)
+            distance.pushDistance(cm, timestamp: Double(i) * 0.1)
+        }
+        XCTAssertEqual(coordinator.phase, .warmup)
+        let mean = pushed.reduce(0, +) / Double(pushed.count)
+        XCTAssertNotEqual(mean, 204)
+        XCTAssertNotEqual(mean, coordinator.config.targetDistanceCM)
+        XCTAssertEqual(coordinator.currentSessionSnapshot.lockedDistanceCM ?? -1, mean,
+                       accuracy: 0.0001)
+
+        // Samples after completion belong to warm-up and must not shift the captured value.
+        distance.pushDistance(230, timestamp: 2.1)
+        XCTAssertEqual(coordinator.currentSessionSnapshot.lockedDistanceCM ?? -1, mean,
+                       accuracy: 0.0001)
+    }
+
+    func testHoldVoidsWhenLeavingValidBandEvenWithinAnchorTolerance() {
+        // Anchor near the band edge: a reading inside the ±4 cm envelope but OUTSIDE the
+        // 180–240 band must void the hold — otherwise the captured mean could sit out of band
+        // and warm-up would open in an immediate distance pause.
+        let (coordinator, distance, _) = makeCoordinator()
+        coordinator.beginAfterSetup()
+        distance.pushDistance(181, timestamp: 0)
+        XCTAssertEqual(coordinator.captureState, .ready)
+        coordinator.beginDistanceCapture()
+        distance.pushDistance(179, timestamp: 0.5)   // drift 2 ≤ 4, but out of band
+        XCTAssertEqual(coordinator.phase, .distanceLock)
+        XCTAssertEqual(coordinator.captureRetryNotice, "Moved too much — try again")
+        XCTAssertNil(coordinator.currentSessionSnapshot.lockedDistanceCM)
+    }
+
+    func testLockedDistanceClearedByBackNavigationAndManualSkip() {
+        // Capture, then Back out of warm-up, then skip the re-entered lock phase: the exported
+        // session must NOT carry the abandoned run's captured distance (DATA_FORMAT contract:
+        // nil when the lock phase was skipped manually).
+        let (coordinator, distance, _) = makeCoordinator()
+        coordinator.beginAfterSetup()
+        lockDistance(distance)
+        XCTAssertEqual(coordinator.phase, .warmup)
+        XCTAssertNotNil(coordinator.currentSessionSnapshot.lockedDistanceCM)
+
+        XCTAssertTrue(coordinator.goBack())
+        XCTAssertEqual(coordinator.phase, .distanceLock)
+        XCTAssertNil(coordinator.currentSessionSnapshot.lockedDistanceCM)
+
+        XCTAssertTrue(coordinator.goNext())          // manual skip, no capture
+        XCTAssertEqual(coordinator.phase, .warmup)
+        XCTAssertNil(coordinator.currentSessionSnapshot.lockedDistanceCM)
+    }
+
+    func testHoldShowsWholeSecondCountdown() {
+        let (coordinator, distance, _) = makeCoordinator()
+        coordinator.beginAfterSetup()
+        distance.pushDistance(200, timestamp: 0)
+        coordinator.beginDistanceCapture()
+        XCTAssertEqual(coordinator.captureState, .holding(remainingSeconds: 2))
+        distance.pushDistance(200, timestamp: 1.1)
+        XCTAssertEqual(coordinator.captureState, .holding(remainingSeconds: 1))
+        distance.pushDistance(200, timestamp: 2.0)
         XCTAssertEqual(coordinator.phase, .warmup)
     }
 
@@ -292,7 +442,7 @@ final class CoordinatorGateTests: XCTestCase {
         XCTAssertEqual(coordinator.guidance, .moveFarther)
 
         // A dwell lock comfortably inside the resume band resumes.
-        lockDistance(distance, at: 190, start: 8)
+        lockDistance(distance, at: 190, start: 8.2)
         XCTAssertFalse(coordinator.isPausedForDistance)
         XCTAssertTrue(speech.hasPending)
     }
@@ -361,6 +511,15 @@ final class CoordinatorGateTests: XCTestCase {
         }
         XCTAssertEqual(trial.distanceCM, 215, accuracy: 0.0001)
         XCTAssertEqual(trial.sizingDistanceCM ?? -1, 215, accuracy: 0.0001)
+    }
+
+    func testSessionRecordsConfiguredWeberContrast() {
+        // Closes the injected-config → session-record loop: the operator's contrast setting
+        // (sampled into the config at flow launch) is what the session exports.
+        var config = ScreenConfig()
+        config.lowContrastWeber = 0.15
+        let (coordinator, _, _) = makeCoordinator(config: config)
+        XCTAssertEqual(coordinator.currentSessionSnapshot.weberContrast, 0.15, accuracy: 1e-9)
     }
 
     // MARK: - Calibration & sizing

@@ -36,13 +36,17 @@ setup → distanceLock → warmup → highContrastGate → lowContrast(×2) → 
    Sloan font loaded, and the display physically large enough for the protocol's worst-case letter.
    If only the *voice* path is blocked, a **"Continue with clinician keypad"** fallback starts the
    session in manual mode; the sizing and distance prerequisites are never waivable.
-2. **Distance lock** — the child is guided to ~2 m. Locking requires the measured distance to stay
-   inside **180–240 cm** for a continuous **0.75 s** window with a standard deviation ≤ **5 cm**.
+2. **Distance lock** — the child is guided to ~2 m, then the OPERATOR captures the distance: the
+   Capture button arms once a fresh reading sits inside **180–240 cm**, tapping it anchors a
+   **2.0 s steady hold** (any reading drifting more than **±4 cm** from the tap-instant anchor, or
+   losing the face, voids the hold with a spoken "try again"), and the mean of the hold window is
+   recorded as `lockedDistanceCM`. Only hold completion advances — steady standing alone never does.
 3. **Warm-up** — 5 unscored high-contrast letters at 20/80, so the child learns the task.
 4. **High-contrast gate** — a black-on-white acuity staircase. The child must reach **20/25** to
    continue. Failing the gate ends the session with `interpretation = "highContrastBelowGate"`.
 5. **Low contrast (duochrome)** — if the gate passes, the two low-contrast conditions run in
-   **randomized order** at **5 % Weber contrast**: dark-red-on-red and dark-teal-on-teal.
+   **randomized order** at **10 % Weber contrast** by default (operator-selectable 5 / 10 / 15 %
+   in Settings): dark-red-on-red and dark-teal-on-teal.
 6. **Results** — the session is written to disk as JSON + CSV, including
    `duochromeDeltaLogMAR = green.logMAR − red.logMAR`.
 
@@ -52,9 +56,11 @@ throttled so it cannot become a chant. A trial that keeps failing to produce an 
 number of same-letter retries and then escalates to a clinician keypad — a dead microphone can never
 cause a silent infinite loop.
 
-The acuity staircase presents 10 trials per level, advances on ≥ 6 correct (or immediately after 5
-consecutive correct), and steps back otherwise. Levels run
-`200, 160, 125, 100, 80, 63, 50, 40, 32, 25, 20, 16`, starting at 20/40.
+The acuity staircase runs the ETDRS five-letter protocol (matching the reference app's
+`ETDRSProgressionEngine`): 5 trials per level, advancing on ≥ 3 correct (or immediately when the
+FIRST 3 are all correct, recorded as a perfect line), stepping back otherwise. The final logMAR is
+scored letter-by-letter across BOTH terminal lines: `base(finer terminal line) + misses × 0.02`.
+Levels run `200, 160, 125, 100, 80, 63, 50, 40, 32, 25, 20, 16`, starting at 20/40.
 
 Every condition draws the letter inside a fixed-size colored square framed by a blue border on a
 black background. The square stays fixed across acuity levels; only the glyph changes size.
@@ -64,8 +70,8 @@ black background. The square stays fixed across acuity levels; only the glyph ch
 These are enforced in code and covered by tests — they are the reason the app can claim a letter was
 truly the size it says it was:
 
-- **A scored letter is never sized from an assumed distance.** Sizing uses a fresh valid sample or
-  the last sample the provider vouched for. There is deliberately no nominal-distance fallback.
+- **A scored letter is never sized from an assumed distance.** Sizing uses a fresh valid sample
+  (never older than 0.5 s) or pauses. There is deliberately no nominal-distance fallback.
 - **An answer is only scored against a fresh, in-band distance sample** taken at answer time — not
   the value captured at lock.
 - **Sizing provenance is re-validated against the live calibration before scoring.** A mid-session
@@ -151,7 +157,7 @@ Myotect/
 ├── docs/                        Extended documentation
 ├── Sources/
 │   ├── MyotectApp.swift         @main entry; registers the Sloan font at launch
-│   ├── ContentView.swift        Main menu: screening, previous results, calibration
+│   ├── ContentView.swift        Main menu (Visinear format): Test, History, Settings
 │   ├── Assets.xcassets/
 │   ├── Resources/
 │   │   ├── Sloan.otf            Optotype font (PostScript name "Sloan")
@@ -188,7 +194,7 @@ retrievable via Finder or the Files app:
 
 - `<sessionID>.json` — the complete session record, including the calibration in force and
   per-trial sizing provenance.
-- `<sessionID>.csv` — one header row plus one row per scored trial (18 columns).
+- `<sessionID>.csv` — one header row plus one row per scored trial (19 columns).
 
 By default **no raw audio buffers and no face geometry are persisted** — only the derived
 eye-to-screen distance scalar per trial. `ScreenConfig.persistRawSignals` is `false` by default and
@@ -205,8 +211,8 @@ Optotype sizing needs a true points-to-millimeters conversion, so it cannot use 
 
 - **Verified devices** calibrate automatically from the DevicePpi database:
   `pointsPerMillimeter = ppi / nativeScale / 25.4`.
-- **Unknown devices** require a one-time operator ruler measurement (*Screen calibration* on the
-  main menu): adjust an on-screen line until it measures exactly 50 mm against a physical ruler.
+- **Unknown devices** require a one-time operator ruler measurement (*Settings → Screen
+  Calibration*): adjust an on-screen line until it measures exactly 50 mm against a physical ruler.
 
 Calibration is bound to an exact screen signature (`machineIdentifier|WxH|nativeScale`) and schema
 version. A stored record whose signature, native scale, or schema no longer matches is **deleted on

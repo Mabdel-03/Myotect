@@ -8,6 +8,8 @@ private final class ManualDistanceProvider: DistanceProvider {
     let isAvailable = true
     private(set) var state: DistanceTrackingState = .idle
     private(set) var latestSample: DistanceSample?
+    /// Taps Capture Distance on the coordinator (wired by `makeCoordinator`); no-op in trials.
+    var captureHook: (() -> Void)?
     private var lastValidity: DistanceValidity = .missing
 
     func start() { state = .tracking }
@@ -56,11 +58,16 @@ final class CoordinatorRetryTests: XCTestCase {
             calibration: StaticScreenCalibrationProvider(
                 calibration: CoordinatorGateTests.testCalibration()),
             screenShortSidePoints: 393)
+        distance.captureHook = { [weak coordinator] in coordinator?.beginDistanceCapture() }
         return (coordinator, distance, speech, fallback)
     }
 
+    /// Full lock: capture tap + 2.1 s steady hold (in trials the tap no-ops and the samples
+    /// satisfy the dwell re-lock instead).
     private func lockDistance(_ distance: ManualDistanceProvider, start: TimeInterval = 0) {
-        for i in 0...10 {
+        distance.pushDistance(200, timestamp: start)
+        distance.captureHook?()
+        for i in 1...21 {
             distance.pushDistance(200, timestamp: start + Double(i) * 0.1)
         }
     }

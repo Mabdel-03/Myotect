@@ -48,20 +48,20 @@ struct AcuityTrialView: View {
         showDebugOverlay || coordinator.inputMode != .voice
     }
 
+    /// Gold "VOICE INPUT ACTIVE" mic-pill treatment: mist surface with teal black-weight text —
+    /// strong contrast over the black stimulus field without lightening it.
     private var operatorStatusStrip: some View {
         VStack {
             Spacer()
-            HStack(spacing: 12) {
-                Text(operatorStatusText)
-                    .font(.footnote)
-                    .foregroundStyle(.white.opacity(0.8))
-                if case .manualFallback(sticky: true) = coordinator.inputMode {
-                    Button("Resume voice input") { coordinator.clinicianRestoreVoiceInput() }
-                        .font(.footnote.weight(.semibold))
+            MyoMicPill {
+                HStack(spacing: 12) {
+                    Text(operatorStatusText)
+                    if case .manualFallback(sticky: true) = coordinator.inputMode {
+                        Button("Resume voice input") { coordinator.clinicianRestoreVoiceInput() }
+                            .foregroundStyle(Color.myoActionBlue)
+                    }
                 }
             }
-            .padding(8)
-            .background(.black.opacity(0.6), in: Capsule())
             .padding(.bottom, 4)
         }
     }

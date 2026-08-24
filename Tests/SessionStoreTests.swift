@@ -28,7 +28,7 @@ final class SessionStoreTests: XCTestCase {
             deviceModel: "iPhone",
             ppiUsed: 326,
             targetDistanceCM: 200,
-            weberContrast: 0.05,
+            weberContrast: 0.10,
             letterSet: SloanLetter.all,
             highContrast: nil,
             lowContrastRed: red,
@@ -70,7 +70,7 @@ final class SessionStoreTests: XCTestCase {
         // Provenance and sizing-distance columns are always present; legacy trials leave them empty.
         for column in ["sizing_distance_cm", "sizing_version", "calibration_source",
                        "points_per_mm", "screen_signature", "target_height_mm",
-                       "rendered_height_points"] {
+                       "rendered_height_points", "weber_contrast"] {
             XCTAssertTrue(lines[0].contains(column), "missing CSV column \(column)")
         }
         let headerFieldCount = lines[0].split(separator: ",", omittingEmptySubsequences: false).count
@@ -114,6 +114,43 @@ final class SessionStoreTests: XCTestCase {
             return out
         }
         XCTAssertEqual(fields(lines[1]).count, fields(lines[0]).count)
+    }
+
+    func testCSVCarriesSessionWeberContrastOnEveryRow() {
+        // With contrast operator-selectable, every trial row must carry the Weber value that
+        // produced it (the JSON has it session-level; the CSV repeats it per row).
+        var session = makeSession(trials: (1...2).map { trial(.lowContrastRed, n: $0) })
+        session = MyopiaScreenSession(
+            sessionID: session.sessionID, startedAt: session.startedAt,
+            completedAt: session.completedAt, appVersion: session.appVersion,
+            deviceModel: session.deviceModel, ppiUsed: session.ppiUsed,
+            targetDistanceCM: session.targetDistanceCM, weberContrast: 0.15,
+            letterSet: session.letterSet, highContrast: session.highContrast,
+            lowContrastRed: session.lowContrastRed, lowContrastGreen: session.lowContrastGreen,
+            duochromeDeltaLogMAR: session.duochromeDeltaLogMAR,
+            interpretation: session.interpretation, trials: session.trials,
+            aborted: session.aborted, abortReason: session.abortReason)
+
+        let lines = SessionStore().csv(for: session).split(separator: "\n").map(String.init)
+        XCTAssertTrue(lines[0].hasSuffix(",weber_contrast"))
+        for row in lines.dropFirst() {
+            XCTAssertTrue(row.hasSuffix(",0.15"), "row missing weber contrast: \(row)")
+        }
+    }
+
+    func testDeleteAllSessionsRemovesEverything() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = SessionStore(fileManager: TempDocumentsFileManager(root: root))
+        try store.save(with(makeSession(), id: "a", completedAt: Date(timeIntervalSince1970: 1_700_000_000)))
+        try store.save(with(makeSession(), id: "b", completedAt: Date(timeIntervalSince1970: 1_700_000_500)))
+        XCTAssertEqual(store.loadAllSessions().count, 2)
+
+        store.deleteAllSessions()
+        XCTAssertTrue(store.loadAllSessions().isEmpty)
     }
 
     func testDeltaIsGreenMinusRed() {

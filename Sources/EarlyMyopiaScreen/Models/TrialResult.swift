@@ -16,7 +16,8 @@ struct TrialResult: Codable, Equatable {
     /// still decodes.
     var sizingDistanceCM: Double? = nil
     let responseTimeMS: Int
-    /// 1-based index within the condition's run.
+    /// 1-based trial number WITHIN the acuity level in progress (gold `nextTrialNumber`
+    /// semantics): resets on every level change, and a distance-pause repeat keeps its number.
     let trialNumber: Int
     let timestamp: Date
     /// Exactly how the visible stimulus was sized (calibration identity, target mm, rendered

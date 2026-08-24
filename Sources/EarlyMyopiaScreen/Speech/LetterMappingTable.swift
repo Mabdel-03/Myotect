@@ -62,8 +62,9 @@ enum LetterMappingTable {
         "oh": "O", "o": "O", "owe": "O", "ohh": "O",
         // R
         "are": "R", "ar": "R", "arr": "R", "r": "R", "aar": "R", "aire": "R",
-        // S
-        "ess": "S", "es": "S", "s": "S", "yes": "S",
+        // S ("yes" is deliberately NOT mapped: a conversational "yes" must never score as S,
+        // and the gold table leaves it unmapped too)
+        "ess": "S", "es": "S", "s": "S",
         // V
         "vee": "V", "vi": "V", "v": "V", "ve": "V", "vea": "V", "via": "V",
         // Z
@@ -83,11 +84,14 @@ enum LetterMappingTable {
         "vie": "V",
     ]
 
-    /// Normalizes a raw transcript: lowercased, trimmed, punctuation stripped.
+    /// Normalizes a raw transcript: lowercased, with every non-letter run replaced by a single
+    /// space (gold `cleanedTranscriptToken`: `[^A-Z]+` → " "). Replacing with a space rather than
+    /// deleting keeps punctuation-joined words apart — "C-D" must become the two tokens "c d"
+    /// (an answer plus a correction), never the unmappable "cd"; "[BLANK_AUDIO]" must become
+    /// "blank audio" (a known silence marker), never "blankaudio".
     static func normalize(_ raw: String) -> String {
         raw.lowercased()
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .components(separatedBy: CharacterSet.punctuationCharacters).joined()
+            .replacingOccurrences(of: "[^a-z]+", with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespaces)
     }
 

@@ -1,11 +1,11 @@
 # Testing Myotect — complete guide
 
 This document covers everything needed to verify Myotect: the automated unit suite (how to run it,
-what every one of its 174 tests asserts), the manual on-device protocol for the parts a simulator
+what every one of its 220 tests asserts), the manual on-device protocol for the parts a simulator
 cannot exercise, physical verification of optotype size, and troubleshooting for the failure modes
 this project actually hits.
 
-**Current status: 174 tests, 0 failures** on iPhone 16 Pro / iOS 18.2.
+**Current status: 220 tests, 0 failures** on iPhone 17 / iOS 26.5.
 
 **Contents**
 
@@ -64,7 +64,7 @@ xcodebuild -project Myotect.xcodeproj -scheme Myotect \
 Expected tail on a green run:
 
 ```
-Executed 174 tests, with 0 failures (0 unexpected) in 0.7 (0.8) seconds
+Executed 220 tests, with 0 failures (0 unexpected)
 ** TEST SUCCEEDED **
 ```
 
@@ -162,34 +162,51 @@ shown. That runs a clean pass end-to-end without a microphone.
 
 ## Part 2 — The unit suite, test by test
 
-**174 tests across 18 files.** All are `XCTest`, synchronous or `@MainActor`, and deterministic —
+**220 tests across 20 files.** All are `XCTest`, synchronous or `@MainActor`, and deterministic —
 no `Date.now` dependence in assertions, no randomness (condition order is injected via
 `lowContrastOrderOverride`), no sleeps.
 
 | File | Tests | Under test |
 | --- | ---: | --- |
-| [CoordinatorGateTests](#coordinatorgatetests--29-tests) | 29 | `MyopiaScreenCoordinator` — the whole state machine |
+| [CoordinatorGateTests](#coordinatorgatetests--38-tests) | 38 | `MyopiaScreenCoordinator` — the whole state machine, incl. the operator capture hold and config→session contrast |
 | [DistanceModelsTests](#distancemodelstests--28-tests) | 28 | Sample validity, validity resolution, emission throttle |
+| [AcuityStaircaseEngineTests](#acuitystaircaseenginetests--21-tests) | 21 | ETDRS five-letter staircase: advance/step-back/terminations/gate/two-terminal logMAR |
+| [LetterMappingTableTests](#lettermappingtabletests--14-tests) | 14 | Transcript → Sloan letter mapping + normalization |
 | [ScreenCalibrationProviderTests](#screencalibrationprovidertests--12-tests) | 12 | Auto + manual calibration, invalidation |
-| [LetterMappingTableTests](#lettermappingtabletests--11-tests) | 11 | Transcript → Sloan letter mapping |
-| [AcuityStaircaseEngineTests](#acuitystaircaseenginetests--10-tests) | 10 | Staircase advance/step-back/gate/logMAR |
 | [DistanceBandGateTests](#distancebandgatetests--10-tests) | 10 | Pause/resume hysteresis |
+| [WhisperTranscriptFilterTests](#whispertranscriptfiltertests--9-tests) | 9 | Filler / silence-hallucination rejection |
 | [OptotypeSizingTests](#optotypesizingtests--9-tests) | 9 | Physical sizing math and render damping |
-| [SizingProvenanceTests](#sizingprovenancetests--8-tests) | 8 | Provenance matching and Codable round-trips |
-| [WhisperTranscriptFilterTests](#whispertranscriptfiltertests--7-tests) | 7 | Filler / silence-hallucination rejection |
+| [DistanceHoldTrackerTests](#distanceholdtrackertests--9-tests) | 9 | Operator-initiated capture hold (anchor, tolerance, countdown, mean) |
 | [CoordinatorRetryTests](#coordinatorretrytests--9-tests) | 9 | Retry → keypad escalation, end to end |
+| [SizingProvenanceTests](#sizingprovenancetests--8-tests) | 8 | Provenance matching and Codable round-trips |
 | [RetryEscalationPolicyTests](#retryescalationpolicytests--8-tests) | 8 | The escalation state machine in isolation |
-| [ContrastPaletteTests](#contrastpalettetests--6-tests) | 6 | Weber contrast and channel isolation |
-| [SessionStoreTests](#sessionstoretests--7-tests) | 7 | JSON/CSV encoding, quoting, delta, load ordering |
+| [SessionStoreTests](#sessionstoretests--7-tests) | 9 | JSON/CSV encoding, quoting, weber column, delta, load ordering, delete-all |
+| [ContrastPaletteTests](#contrastpalettetests--6-tests) | 8 | Weber contrast (5/10/15%), defaults, channel isolation |
+| [CoordinatorTTSTests](#coordinatorttstests--6-tests) | 6 | Spoken prompts wired into the flow |
 | [ARKitDistanceProviderTests](#arkitdistanceprovidertests--5-tests) | 5 | Smoothing and plausibility rejection |
-| [CoordinatorTTSTests](#coordinatorttstests--5-tests) | 5 | Spoken prompts wired into the flow |
 | [SpeechAnnouncerTests](#speechannouncertests--5-tests) | 5 | Utterance lifecycle and completion-exactly-once |
 | [PromptThrottleTests](#promptthrottletests--4-tests) | 4 | Repeat-prompt throttling |
+| [ScreeningSettingsProviderTests](#screeningsettingsprovidertests--7-tests) | 7 | Operator settings store: defaults, round trips, self-invalidation, notifications |
 | [MyotectTests](#myotecttests--1-test) | 1 | Placeholder |
+
+### ScreeningSettingsProviderTests — 7 tests
+
+Pins the operator-settings store (`ScreeningSettingsProvider`): empty defaults → 10% Weber +
+audio on; save/read round trips for every 5/10/15% × audio combination; garbage, schema-mismatch,
+and disallowed-weber records return defaults AND delete themselves; save/reset post
+`.screeningSettingsDidChange` with the new value. Suite-isolated `UserDefaults(suiteName:)` per
+test, per the `ScreenCalibrationProviderTests` harness.
+
+### DistanceHoldTrackerTests — 9 tests
+
+Pins the operator-initiated capture hold to the gold semantics: tap-instant anchor, hard ±4 cm
+envelope judged against the ANCHOR (not the last reading), whole-second countdown values,
+timestamp-deduped mean of the steady window, face-loss/drift voids, cancel-discards-silently, and
+fresh re-anchoring after a void.
 
 ---
 
-### CoordinatorGateTests — 29 tests
+### CoordinatorGateTests — 38 tests
 
 The largest and most important file: it drives `MyopiaScreenCoordinator` through complete flows with
 injected mocks, asserting the protocol invariants listed in the README. A static
@@ -200,7 +217,14 @@ reproducible.
 
 | Test | Asserts |
 | --- | --- |
-| `testReachesWarmupAfterDistanceLock` | Dwell lock in the valid band transitions `distanceLock → warmup` |
+| `testReachesWarmupAfterDistanceLock` | Operator Capture tap + completed 2 s hold transitions `distanceLock → warmup` and records `lockedDistanceCM` |
+| `testValidSamplesAloneNeverAdvancePastDistanceLock` | However long the subject stands steady in band, nothing advances without the tapped hold |
+| `testCaptureNotReadyOutOfBandAndTapRefused` | Out-of-band readings never arm Capture; a stray tap starts nothing |
+| `testHoldVoidsOnDriftWithRetryNoticeThenRecaptures` / `testHoldVoidsOnFaceLoss` | Anchor drift > 4 cm or face loss voids the hold with the gold retry notice |
+| `testHoldVoidsWhenLeavingValidBandEvenWithinAnchorTolerance` | A hold near the band edge cannot complete out of band |
+| `testHoldWithinToleranceCapturesMeanOfWindow` | The recorded `lockedDistanceCM` is the deduped hold-window mean (≠ anchor, ≠ target), frozen at completion |
+| `testHoldShowsWholeSecondCountdown` | `captureState` counts "2 s → 1 s" from sample timestamps |
+| `testLockedDistanceClearedByBackNavigationAndManualSkip` | Back + manual skip never exports an abandoned run's captured distance |
 | `testGatePassRunsBothLowContrastConditions` | Passing the 20/25 gate runs red *and* teal, then results |
 | `testGateFailSkipsLowContrast` | Failing the gate skips low contrast entirely and records `interpretation = "highContrastBelowGate"` |
 | `testAmbiguousRepeatsSameLetterWithoutAdvancing` | An ambiguous answer re-presents the *same* letter and records no trial |
@@ -290,7 +314,7 @@ mis-size letters on different hardware.
 
 ---
 
-### LetterMappingTableTests — 11 tests
+### LetterMappingTableTests — 14 tests
 
 `testCommonPhonetics` ("see"→C, "aitch"→H, "kay"→K …) · `testCaseAndPunctuationInsensitive` ·
 `testSingleLetterDirectMatch` · `testNonSloanReturnsNil` · `testClassifySingleLetter` ·
@@ -304,14 +328,27 @@ can never introduce a non-Sloan target or shadow a genuine phonetic spelling.
 
 ---
 
-### AcuityStaircaseEngineTests — 10 tests
+### AcuityStaircaseEngineTests — 21 tests
 
-`testStartsAtConfiguredAcuity` · `testAcuityLevelsContain25` (the gate must be a real level) ·
-`testAdvanceOnSixOfTen` · `testEarlySkipAdvancesAtFifthCorrect` (5 consecutive correct passes the
-level immediately and records a perfect score) · `testStepBackBelowSix` · `testContinuesWithinLevel` ·
-`testGateReachedAtTwentyFive` · `testGateNotReachedWhenStuckAtThirtyTwo` ·
-`testLogMARIncludesErrorAdjustment` (table value + `wrong / 100`) · `testLowContrastConfigHasNoGate`
-(`gateAcuity = nil` ⇒ `reachedGate` always true).
+Pins the gold ETDRS five-letter protocol (5 trials/level, ≥3 to advance, early-perfect at 3,
+two-terminal-line ±0.02/letter scoring), ported from the reference
+`ETDRSProgressionEngineTests`.
+
+`testConfigurationIsFiveLetterProtocol` · `testStartsAtConfiguredAcuity` ·
+`testAcuityLevelsContain25` (the gate must be a real level) ·
+`testThreeInitialCorrectUsePerfectShortcut` · `testAnyMissInFirstThreeRequiresAllFiveResponses` ·
+`testThreeOfFiveAdvances` · `testTwoOfFiveStepsBackToUntestedLargerAcuity` ·
+`testContinuesWithinLevel` · `testNextTrialNumberCountsWithinLevelAndResetsOnChange` ·
+`testFailingAboveAPassedLevelFinishesWithFailedLineAsPrimary` (primary = the FAILED finer line) ·
+`testAdvancingIntoAlreadyCompletedLevelFinishesInsteadOfRetesting` (a completed line is never
+re-tested or overwritten) · `testFailAtLargestLevelScoresAgainstSecondLargest` ·
+`testPassingFinestLevelFinishes` · `testFailingFinestLevelStillScoresFromItAsPrimary` ·
+`testMissedLettersAcrossBothTerminalLinesAllCount` (every miss on BOTH terminal lines credits
+0.02) · `testPassingFinestAsStartScoresUntestedCoarserSecondaryAsZero` (untested coarser terminal
+line scores 0 correct, +0.1 logMAR — gold's smallest-boundary rule) · `testGateReachedAtTwentyFive` ·
+`testGateNotReachedWhenStuckAtThirtyTwo` · `testGateNeverOpensOnAFailedPrimaryLine` ·
+`testLowContrastConfigHasNoGate` (`gateAcuity = nil` ⇒ `reachedGate` always true) ·
+`testEarlyPerfectRecordsFullLineInPerLevelCorrect`.
 
 ---
 
@@ -357,7 +394,7 @@ so archived sessions stay comparable to live ones.
 
 ---
 
-### WhisperTranscriptFilterTests — 7 tests
+### WhisperTranscriptFilterTests — 9 tests
 
 `nonAnswerKind(_:)` runs *before* the letter mapper and separates "the child made a sound" from "the
 microphone heard nothing".
@@ -374,7 +411,13 @@ answer unanswerable.
 
 ---
 
-### ContrastPaletteTests — 6 tests
+### ContrastPaletteTests — 8 tests
+
+New with the configurable-contrast work: `testWeberFifteenPercent` (0.85 at 15% — a
+protocol-selectable value) and `testContrastConfigDefaultIsTenPercent` (pins BOTH
+`ContrastConfig().weber` and `ScreenConfig().lowContrastWeber` to the 10% protocol default so
+they can never silently drift apart). The red/teal channel tests now pin behavior against an
+explicit `ContrastConfig(weber: 0.10)` (stimulus channel = 0.90 of background).
 
 `testWeberFivePercent` and `testWeberTenPercent` pin `stimulus = background × (1 − weber)` ·
 `testWeberMatchesMeetingExample` pins the agreed clinical worked example ·
@@ -384,7 +427,11 @@ light contaminates the short-wavelength stimulus, so red must be exactly 0 in th
 
 ---
 
-### SessionStoreTests — 7 tests
+### SessionStoreTests — 9 tests
+
+New with the configurable-contrast work: `testCSVCarriesSessionWeberContrastOnEveryRow` (the
+19th `weber_contrast` column repeats the session value on every trial row) and
+`testDeleteAllSessionsRemovesEverything` (Clear All History wipes the store).
 
 `testJSONRoundTrip` · `testDecodeJSONRoundTrip` (ISO-8601 dates, sorted keys) ·
 `testCSVRowCountMatchesTrials` (header + one row per trial) · `testDeltaIsGreenMinusRed` (sign
@@ -436,7 +483,7 @@ re-prompt, later ones do not) · `testBeginTrialResetsAttemptCount` ·
 `testForceStickyManualSurvivesResolvedTrials` (the keypad-only start latches until the clinician
 restores voice, rather than clearing on the first successful answer).
 
-### CoordinatorTTSTests — 5 tests
+### CoordinatorTTSTests — 6 tests
 
 `testPhasePromptsAreSpoken` · `testFirstRetrySpeaksReprompt` ·
 `testDistanceGuidanceIsSpokenAndThrottled` · `testCompletionSpeaksAllDone`.

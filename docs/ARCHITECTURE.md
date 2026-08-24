@@ -55,6 +55,10 @@ Ported from the sibling Distance Measure Test app's `processNextTrial` (transiti
   (`ppi / nativeScale / 25.4`) or from an operator ruler measurement persisted in `UserDefaults`.
   Injected as `ScreenCalibrationProviding`, never a singleton.
 - **`ContrastPalette`** — Weber contrast pairs, `stimulus = background × (1 − weber)`.
+- **`ScreeningSettingsProvider`** — operator settings (5/10/15 % Weber choice, audio prompts) in
+  UserDefaults, self-invalidating on read, sampled into the flow's `ScreenConfig` at launch.
+- **`Sources/Theme/`** — the Visinear-format design system (colors, text styles, buttons, pills,
+  cards, decorative daisies) shared by every screen; trial stimulus rendering does not use it.
 - **`SessionStore`** — JSON + CSV to `Documents/MyopiaSessions/`.
 - **`BrightnessController`** — locks test brightness, restores the user's value on completion,
   abort, and backgrounding.
@@ -68,7 +72,8 @@ outside them**, which is why the policy is exhaustively testable without hardwar
 | Type | Responsibility |
 | --- | --- |
 | `DistanceSample` / `DistanceValidity` | A reading, and an explicit trust verdict with a reason |
-| `DistanceStabilityEvaluator` | Dwell-lock policy → `DistanceStatus` guidance |
+| `DistanceStabilityEvaluator` | Dwell-lock policy → `DistanceStatus` guidance (in-trial resume) |
+| `DistanceHoldTracker` | Operator-initiated capture: tap-anchored 2 s hold, ±4 cm envelope, mean of the steady window |
 | `DistanceBandGate` | Pause/resume hysteresis (full band out, inset band in) |
 | `ARKitDistanceProvider` | Real face tracking; smoothing + plausibility rejection |
 | `MockDistanceProvider` | Steady or scripted events, for simulator/tests |
@@ -154,7 +159,7 @@ controls call `goBack()` / `goNext()` on the coordinator.
 ## The state machine
 
 ```
-setup ──Begin──▶ distanceLock ──lock──▶ warmup ──5 letters──▶ highContrastGate
+setup ──Begin──▶ distanceLock ──capture hold──▶ warmup ──5 letters──▶ highContrastGate
                                                                     │
                                             ┌───gate failed─────────┤
                                             ▼                       │ gate passed (20/25)
@@ -184,9 +189,10 @@ Then the **same letter** re-presents. Foregrounding alone never resumes scoring.
 
 Each of these is enforced in code and pinned by a test:
 
-**A scored letter is never sized from an assumed distance.** `sizedSpec` uses a fresh valid sample or
-the last sample the provider vouched for — there is deliberately no nominal-distance fallback. If
-neither exists, the presentation pauses rather than showing a letter of unknown angular size.
+**A scored letter is never sized from an assumed distance.** `sizedSpec` uses a fresh valid sample
+from the provider (never older than `maximumSampleAgeSeconds`) — there is deliberately no
+nominal-distance fallback and no cached-sample fallback. If no trusted sample exists, the
+presentation pauses rather than showing a letter of unknown angular size.
 
 **An answer is scored only against a fresh, in-band sample at answer time.** If the measurement
 lapsed between presentation and response, the answer cannot be trusted; the trial pauses and repeats.

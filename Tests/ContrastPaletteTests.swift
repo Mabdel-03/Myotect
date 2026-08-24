@@ -16,6 +16,18 @@ final class ContrastPaletteTests: XCTestCase {
         XCTAssertEqual(ContrastPalette.stimulusBrightness(background: 0.50, weber: 0.05), 0.475, accuracy: 1e-9)
     }
 
+    func testWeberFifteenPercent() {
+        // 15% is a protocol-selectable value (Settings: 5/10/15%).
+        XCTAssertEqual(ContrastPalette.stimulusBrightness(background: 1.0, weber: 0.15), 0.85, accuracy: 1e-9)
+    }
+
+    func testContrastConfigDefaultIsTenPercent() {
+        // The protocol default is 10% Weber; the type default is pinned deliberately so it can
+        // never silently drift from `ScreenConfig.lowContrastWeber`.
+        XCTAssertEqual(ContrastConfig().weber, 0.10, accuracy: 1e-9)
+        XCTAssertEqual(ScreenConfig().lowContrastWeber, 0.10, accuracy: 1e-9)
+    }
+
     func testHighContrastIsBlackOnWhite() {
         let colors = ContrastPalette.colors(for: .highContrast, config: ContrastConfig())
         XCTAssertEqual(colors.background, .white)
@@ -23,19 +35,22 @@ final class ContrastPaletteTests: XCTestCase {
     }
 
     func testRedConditionIsolatesRedChannel() {
-        let colors = ContrastPalette.colors(for: .lowContrastRed, config: ContrastConfig())
+        // Pins the behavior against an EXPLICIT weber, not the type default.
+        let colors = ContrastPalette.colors(for: .lowContrastRed,
+                                            config: ContrastConfig(weber: 0.10))
         let bg = colors.background.sRGBComponents
         let stim = colors.stimulus.sRGBComponents
         XCTAssertEqual(bg.green, 0, accuracy: 1e-6)
         XCTAssertEqual(bg.blue, 0, accuracy: 1e-6)
         XCTAssertEqual(stim.green, 0, accuracy: 1e-6)
-        XCTAssertEqual(stim.red, 0.95, accuracy: 1e-3)
+        XCTAssertEqual(stim.red, 0.90, accuracy: 1e-3)
     }
 
     func testTealConditionIsBlueGreen() {
         // Short-wavelength condition is teal: green channel plus a matching fraction in blue, red at 0.
-        // Weber contrast is preserved per channel (stimulus green is 0.95 of background at 5% Weber).
-        let colors = ContrastPalette.colors(for: .lowContrastGreen, config: ContrastConfig())
+        // Weber contrast is preserved per channel (stimulus green is 0.90 of background at 10% Weber).
+        let colors = ContrastPalette.colors(for: .lowContrastGreen,
+                                            config: ContrastConfig(weber: 0.10))
         let bg = colors.background.sRGBComponents
         let stim = colors.stimulus.sRGBComponents
         let f = ContrastPalette.tealBlueFraction
@@ -43,8 +58,8 @@ final class ContrastPaletteTests: XCTestCase {
         XCTAssertEqual(Double(bg.green), 1.0, accuracy: 1e-6)
         XCTAssertEqual(Double(bg.blue), 1.0 * f, accuracy: 1e-3)
         XCTAssertEqual(stim.red, 0, accuracy: 1e-6)
-        XCTAssertEqual(Double(stim.green), 0.95, accuracy: 1e-3)
-        XCTAssertEqual(Double(stim.blue), 0.95 * f, accuracy: 1e-3)
+        XCTAssertEqual(Double(stim.green), 0.90, accuracy: 1e-3)
+        XCTAssertEqual(Double(stim.blue), 0.90 * f, accuracy: 1e-3)
     }
 }
 

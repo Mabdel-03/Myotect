@@ -8,6 +8,8 @@ private final class ManualDistanceProvider: DistanceProvider {
     let isAvailable = true
     private(set) var state: DistanceTrackingState = .idle
     private(set) var latestSample: DistanceSample?
+    /// Taps Capture Distance on the coordinator (wired by `makeCoordinator`); no-op in trials.
+    var captureHook: (() -> Void)?
     private var lastValidity: DistanceValidity = .missing
 
     func start() { state = .tracking }
@@ -81,11 +83,16 @@ final class CoordinatorTTSTests: XCTestCase {
             calibration: StaticScreenCalibrationProvider(
                 calibration: CoordinatorGateTests.testCalibration()),
             screenShortSidePoints: 393)
+        distance.captureHook = { [weak coordinator] in coordinator?.beginDistanceCapture() }
         return (coordinator, distance, speech, announcer)
     }
 
+    /// Full lock: capture tap + 2.1 s steady hold (in trials the tap no-ops and the samples
+    /// satisfy the dwell re-lock instead).
     private func lockDistance(_ distance: ManualDistanceProvider, start: TimeInterval = 0) {
-        for i in 0...10 {
+        distance.pushDistance(200, timestamp: start)
+        distance.captureHook?()
+        for i in 1...21 {
             distance.pushDistance(200, timestamp: start + Double(i) * 0.1)
         }
     }
@@ -121,6 +128,25 @@ final class CoordinatorTTSTests: XCTestCase {
         // The second retry is silent.
         speech.answer(.unrecognized(.silence))
         XCTAssertEqual(announcer.spoken.filter { $0 == .tryAgain }.count, 1)
+    }
+
+    func testVoidHoldPromptIsNotSupersededByGuidanceSpeech() {
+        // A voided hold speaks its "try again" prompt; the announcer SUPERSEDES rather than
+        // queues, so guidance speech must stay quiet while the void notice is up or the prompt
+        // would be cut off mid-word (the face-lost watchdog re-pushes .missing every 0.25 s).
+        let (coordinator, distance, _, announcer) = makeCoordinator()
+        coordinator.beginAfterSetup()
+        distance.pushDistance(200, timestamp: 0)
+        coordinator.beginDistanceCapture()
+        XCTAssertTrue(announcer.spoken.contains(.holdStill))
+
+        distance.push(.missing)                      // voids the hold
+        XCTAssertTrue(announcer.spoken.contains(.lostFace))
+
+        distance.push(.missing)                      // watchdog repeats while the notice is up
+        distance.push(.missing)
+        XCTAssertFalse(announcer.spoken.contains(.stepIntoView),
+                       "guidance speech while the void notice is up would cut off the prompt")
     }
 
     func testDistanceGuidanceIsSpokenAndThrottled() {

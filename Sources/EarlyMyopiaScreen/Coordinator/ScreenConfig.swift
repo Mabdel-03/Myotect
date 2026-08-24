@@ -8,12 +8,24 @@ import Foundation
 struct ScreenConfig {
     // MARK: Distance
     var targetDistanceCM: Double = 200
-    /// Band the subject must hold to lock and to keep a trial valid.
+    /// Band the subject must hold to lock and to keep a trial valid. The lower bound is a
+    /// deliberate tightening of the reference app's 0.8× fraction (0.9× here): a too-close child
+    /// inflates measured acuity, so the near side of the band is stricter.
     var validDistanceRangeCM: ClosedRange<Double> = 180...240
     /// Wider band the ARKit provider accepts as plausible readings (rejects noise outside this).
     var providerDistanceRangeCM: ClosedRange<Double> = 100...300
+    /// In-trial dwell re-lock only (resume after a distance pause). The initial capture uses the
+    /// operator-initiated hold below instead.
     var distanceStableWindowSeconds: TimeInterval = 0.75
     var maxDistanceSDCM: Double = 5
+
+    // MARK: Distance capture (operator-initiated hold)
+    /// How long the phone must stay put after the operator taps Capture (gold-standard: 2.0 s).
+    var holdDurationSeconds: TimeInterval = 2.0
+    /// Maximum deviation from the tap-instant anchor before the hold voids (gold-standard: 4 cm).
+    var holdToleranceCM: Double = 4.0
+    /// How long a "that didn't work — try again" notice stays up before clearing itself.
+    var captureRetryNoticeSeconds: TimeInterval = 2.5
 
     // MARK: Distance sampling / validity
     /// A sample older than this is stale and never trusted for sizing or scoring.
@@ -40,15 +52,19 @@ struct ScreenConfig {
     // MARK: Acuity staircase
     var acuityLevels: [Int] = [200, 160, 125, 100, 80, 63, 50, 40, 32, 25, 20, 16]
     var startAcuity: Int = 40
-    var trialsPerLevel: Int = 10
-    var advanceThreshold: Int = 6
-    var earlySkipCount: Int = 5
+    /// ETDRS five-letter protocol (gold `ETDRSProtocolConfiguration.fiveLetterV1`):
+    /// 5 trials per line, ≥3 correct to advance, early-perfect pass at 3 straight correct.
+    var trialsPerLevel: Int = 5
+    var advanceThreshold: Int = 3
+    var earlySkipCount: Int = 3
     /// Gate denominator for the high-contrast condition.
     var gateAcuity: Int = 25
 
     // MARK: Contrast
-    var lowContrastWeber: Double = 0.05
-    var fallbackWeber: Double = 0.10
+    /// Weber contrast for the two low-contrast conditions. 10% by default; operator-selectable
+    /// 5/10/15% in Settings. Read once when the screening flow launches — immutable mid-session
+    /// (and recorded on the session as `weberContrast`).
+    var lowContrastWeber: Double = 0.10
     var backgroundBrightness: Double = 1.0
 
     // MARK: Display
@@ -89,8 +105,8 @@ struct ScreenConfig {
     /// Delay after an audio-session category switch before speaking, so the onset isn't clipped.
     var categorySettleSeconds: TimeInterval = 0.15
     /// Delay between an announcement finishing and recognition re-arming, so the tail of the
-    /// prompt never bleeds into Whisper's capture window.
-    var listenResumeAfterSpeechSeconds: TimeInterval = 1.0
+    /// prompt never bleeds into Whisper's capture window (gold-standard: 1.5 s).
+    var listenResumeAfterSpeechSeconds: TimeInterval = 1.5
     /// Minimum interval before the SAME distance-guidance prompt repeats.
     var distancePromptMinIntervalSeconds: TimeInterval = 5
     /// When true, "Say the letter you see." is spoken before every scored trial (default: only
@@ -116,8 +132,8 @@ struct ScreenConfig {
     }
 
     /// Contrast config for a low-contrast condition (high contrast ignores this).
-    func contrastConfig(weber: Double? = nil) -> ContrastConfig {
-        ContrastConfig(weber: weber ?? lowContrastWeber, backgroundBrightness: backgroundBrightness)
+    func contrastConfig() -> ContrastConfig {
+        ContrastConfig(weber: lowContrastWeber, backgroundBrightness: backgroundBrightness)
     }
 
     /// The device/protocol combination is structurally invalid: the worst-case optotype cannot

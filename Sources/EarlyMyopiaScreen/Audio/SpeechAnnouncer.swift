@@ -12,9 +12,12 @@ struct SpokenPrompt: Equatable, Hashable {
     static let warmupIntro = SpokenPrompt(text: "Let's practice. Say each letter out loud.")
     static let testBegins = SpokenPrompt(text: "Here we go. Say the letter you see.")
     static let moveCloser = SpokenPrompt(text: "Move closer.")
-    static let moveFarther = SpokenPrompt(text: "Move farther away.")
+    static let moveFarther = SpokenPrompt(text: "Move farther.")
     static let stepIntoView = SpokenPrompt(text: "I can't see you. Step back into view.")
     static let holdStill = SpokenPrompt(text: "Hold still.")
+    /// Void-hold feedback during the operator-initiated capture (gold wording).
+    static let movedTooMuch = SpokenPrompt(text: "Moved too much. Please try again.")
+    static let lostFace = SpokenPrompt(text: "Lost your face. Please try again.")
     static let allDone = SpokenPrompt(text: "All done. Great job!")
 }
 

@@ -29,6 +29,18 @@ final class WhisperTranscriptFilterTests: XCTestCase {
         XCTAssertEqual(WhisperTranscriptFilter.nonAnswerKind("[silence]"), .silence)
     }
 
+    func testSilenceKindForBracketedWhisperMarkers() {
+        // Whisper's classic bracketed markers: underscores/brackets normalize to spaced tokens,
+        // and the compact forms are covered too (gold-standard behavior). Missing these
+        // misreported true silence as "heard mumbling" to the operator.
+        XCTAssertEqual(WhisperTranscriptFilter.nonAnswerKind("[BLANK_AUDIO]"), .silence)
+        XCTAssertEqual(WhisperTranscriptFilter.nonAnswerKind("BLANK_AUDIO"), .silence)
+        XCTAssertEqual(WhisperTranscriptFilter.nonAnswerKind("(blank audio)"), .silence)
+        XCTAssertEqual(WhisperTranscriptFilter.nonAnswerKind("[SILENT_AUDIO]"), .silence)
+        XCTAssertEqual(WhisperTranscriptFilter.nonAnswerKind("blankaudio"), .silence)
+        XCTAssertEqual(WhisperTranscriptFilter.nonAnswerKind("silentaudio"), .silence)
+    }
+
     func testSilenceKindForEmptyAndWhitespace() {
         XCTAssertEqual(WhisperTranscriptFilter.nonAnswerKind(""), .silence)
         XCTAssertEqual(WhisperTranscriptFilter.nonAnswerKind("   "), .silence)
@@ -41,6 +53,19 @@ final class WhisperTranscriptFilterTests: XCTestCase {
         for phrase in ["see", "C", "aitch", "zed", "oh", "okay", "and", "or", "our", "in", "vie"] {
             XCTAssertNil(WhisperTranscriptFilter.nonAnswerKind(phrase),
                          "\"\(phrase)\" must reach the letter mapper")
+        }
+    }
+
+    func testHesitationPrefixedAnswersReachTheMapper() {
+        // A hesitant child's "filler + letter" must never be swallowed as filler: the compact
+        // form of "er r" is "err" and of "uh h" is "uhh" — checking the compact form against
+        // the FILLER set (unlike gold) would discard these correct answers. The filter must
+        // pass them through, and the mapper must then resolve the letter.
+        for (phrase, letter) in [("Er, R", "R"), ("Uh, H", "H"), ("Ah... H", "H"), ("Eh, H", "H")] {
+            XCTAssertNil(WhisperTranscriptFilter.nonAnswerKind(phrase),
+                         "\"\(phrase)\" must reach the letter mapper")
+            XCTAssertEqual(LetterMappingTable.classify(phrase), .letter(letter),
+                           "\"\(phrase)\" must resolve to \(letter)")
         }
     }
 

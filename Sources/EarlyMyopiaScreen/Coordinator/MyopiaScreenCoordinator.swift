@@ -36,6 +36,24 @@ final class MyopiaScreenCoordinator: ObservableObject {
     @Published var serviceAlert: RecognitionServiceFailure?
     /// Distance-guidance pill state (lock screen and in-trial overlay).
     @Published private(set) var guidance: DistanceGuidanceState = .hidden
+    /// Where the operator-initiated distance capture stands (lock screen only). The Capture
+    /// button is live only in `.ready`; `.holding` carries the whole-second countdown.
+    @Published private(set) var captureState: DistanceCaptureState = .waitingForSubject
+    /// Transient "that didn't work — try again" notice after a voided hold; clears itself after
+    /// `captureRetryNoticeSeconds` (gold retry-notice behavior).
+    @Published private(set) var captureRetryNotice: String?
+
+    /// State machine of the operator-initiated capture (port of the gold `CaptureState`).
+    enum DistanceCaptureState: Equatable {
+        /// No fresh in-band reading to capture — the subject is out of position or untracked.
+        case waitingForSubject
+        /// A fresh in-band reading exists; waiting on the operator to tap Capture.
+        case ready
+        /// Hold countdown running; the phone and subject have to stay put.
+        case holding(remainingSeconds: Int)
+        /// Distance captured; transitioning to warm-up.
+        case captured
+    }
 
     enum TrialInputMode: Equatable {
         case voice
@@ -86,9 +104,9 @@ final class MyopiaScreenCoordinator: ObservableObject {
     /// Boundary hysteresis for in-trial pause/resume (pause at the band edge, resume only inside
     /// the inset band after a fresh dwell lock).
     private let bandGate: DistanceBandGate
-    /// Last sample the provider vouched for; used to size a re-presented stimulus when the
-    /// instantaneous pull happens to miss (e.g. between anchor updates).
-    private var lastValidSample: DistanceSample?
+    /// The operator-initiated capture hold (tap anchors it; 2 s steady completes it).
+    private var holdTracker: DistanceHoldTracker
+    private var captureRetryDismissTask: Task<Void, Never>?
     /// Distance the currently visible stimulus was sized for (recorded per trial).
     private var currentSizingDistanceCM: Double?
     /// The validated calibration snapshotted when the session began; every stimulus in the
@@ -101,8 +119,6 @@ final class MyopiaScreenCoordinator: ObservableObject {
     private var activeCondition: ColorCondition?
     private var lowContrastOrder: [ColorCondition] = []
     private var lowContrastResults: [ColorCondition: AcuityConditionResult] = [:]
-    private var trialNumber = 0
-    private var trialCounter = 0
     private var currentLetter = ""
     private var stimulusShownAt: Date?
     private var mutableSession: MyopiaScreenSession
@@ -164,6 +180,9 @@ final class MyopiaScreenCoordinator: ObservableObject {
             validRange: config.validDistanceRangeCM,
             window: config.distanceStableWindowSeconds,
             maxStandardDeviation: config.maxDistanceSDCM)
+        self.holdTracker = DistanceHoldTracker(
+            durationSeconds: config.holdDurationSeconds,
+            toleranceCM: config.holdToleranceCM)
         self.bandGate = DistanceBandGate(
             band: config.validDistanceRangeCM,
             maxInsetCM: config.resumeInsetMaxCM,
@@ -186,6 +205,8 @@ final class MyopiaScreenCoordinator: ObservableObject {
             trials: [],
             aborted: false,
             abortReason: nil)
+        mutableSession.staircaseProtocol = StaircaseProtocolMetadata(
+            config: config.staircaseConfig(gated: true))
 
         speechEventsSub = self.announcer.events.sink { [weak self] event in
             MainActor.assumeIsolated {
@@ -284,12 +305,14 @@ final class MyopiaScreenCoordinator: ObservableObject {
         distance.start()
         phase = .distanceLock
         stability.reset()
+        resetCaptureFlow()
     }
 
     /// Restores brightness and stops providers. Call on disappear, abort, or backgrounding.
     func teardown() {
         presentationEpoch &+= 1
         pendingListenAfterSpeech = false
+        resetCaptureFlow()
         distance.stop()
         speech.cancel()
         capture?.endCaptureSession()
@@ -323,6 +346,7 @@ final class MyopiaScreenCoordinator: ObservableObject {
             guidance = .warning(message: "Screening paused")
         case .distanceLock:
             stability.reset()
+            resetCaptureFlow()
         default:
             break
         }
@@ -357,6 +381,7 @@ final class MyopiaScreenCoordinator: ObservableObject {
             return false
         case .distanceLock:
             resetRunStateForBack()
+            resetCaptureFlow()
             distance.stop()
             capture?.endCaptureSession()
             announcer.setMicrophoneCaptureActive(false)
@@ -392,6 +417,10 @@ final class MyopiaScreenCoordinator: ObservableObject {
         case .distanceLock:
             // The distance provider is already running from beginAfterSetup(); just enter warm-up.
             clearTrialRunState()
+            resetCaptureFlow()
+            // A manual skip means no capture backs this run — a value left over from an
+            // abandoned earlier lock must not be exported as if it did.
+            mutableSession.lockedDistanceCM = nil
             enterWarmup()
             return true
         case .warmup:
@@ -428,7 +457,6 @@ final class MyopiaScreenCoordinator: ObservableObject {
         currentSizingDistanceCM = nil
         engine = nil
         activeCondition = nil
-        trialNumber = 0
         currentLetter = ""
         stimulusShownAt = nil
     }
@@ -449,6 +477,9 @@ final class MyopiaScreenCoordinator: ObservableObject {
         mutableSession.lowContrastGreen = nil
         mutableSession.duochromeDeltaLogMAR = nil
         mutableSession.interpretation = "notComputed"
+        // The abandoned run's captured distance must not describe the re-run's lock: it is
+        // rewritten by the next hold completion, or stays nil if the lock phase is skipped.
+        mutableSession.lockedDistanceCM = nil
         lowContrastOrder = []
         lowContrastResults = [:]
     }
@@ -461,6 +492,7 @@ final class MyopiaScreenCoordinator: ObservableObject {
         distance.stop()
         distance.start()
         stability.reset()
+        resetCaptureFlow()
         promptThrottle.reset()
         guidance = .hidden
         phase = .distanceLock
@@ -470,7 +502,6 @@ final class MyopiaScreenCoordinator: ObservableObject {
 
     private func handleDistanceUpdate(_ validity: DistanceValidity) {
         if case .valid(let sample) = validity {
-            lastValidSample = sample
             liveDistanceCM = sample.distanceCM
         }
         let status = stability.evaluate(validity)
@@ -478,11 +509,14 @@ final class MyopiaScreenCoordinator: ObservableObject {
         switch phase {
         case .distanceLock:
             distanceStatus = status
-            if status == .locked {
-                showLockedConfirmation()
-                advanceToWarmup()
+            // The operator decides when to capture (gold user-initiated flow): a valid reading
+            // alone only ENABLES the Capture button; nothing advances until a tapped hold
+            // completes its steady window.
+            if holdTracker.isActive {
+                handleHoldUpdate(validity)
             } else {
-                updateGuidance(for: status)
+                captureState = captureReadiness(validity)
+                updateLockPhaseGuidance(for: status)
             }
         case .warmup, .highContrastGate, .lowContrast:
             distanceStatus = status
@@ -514,10 +548,131 @@ final class MyopiaScreenCoordinator: ObservableObject {
         }
     }
 
+    // MARK: - Operator-initiated distance capture (gold DistanceOptimization hold flow)
+
+    /// Starts the capture hold when the operator taps Capture Distance. The reading at the moment
+    /// of the tap becomes the anchor the rest of the hold is judged against. The button is
+    /// disabled outside `.ready`, but a tap can land in the same run-loop turn as a tracking
+    /// loss, so the fresh pull-side sample is re-checked here (gold rule).
+    func beginDistanceCapture() {
+        guard phase == .distanceLock, !holdTracker.isActive,
+              let sample = distance.validSample(maximumAge: config.maximumSampleAgeSeconds),
+              config.validDistanceRangeCM.contains(sample.distanceCM) else { return }
+        clearCaptureRetryNotice()
+        holdTracker.begin(with: sample)
+        captureState = .holding(
+            remainingSeconds: max(1, Int(config.holdDurationSeconds.rounded(.up))))
+        // The countdown replaces the pill while holding.
+        okDismissTask?.cancel()
+        guidance = .hidden
+        announcer.speak(.holdStill)
+    }
+
+    private func handleHoldUpdate(_ validity: DistanceValidity) {
+        // The hold must also stay inside the valid band, not just the ±tolerance anchor
+        // envelope: an anchor near the band edge could otherwise complete with the subject
+        // outside the band — recording an out-of-band lockedDistanceCM and dropping warm-up
+        // straight into a distance pause (the same trap the in-band arming rule closes).
+        if case .valid(let sample) = validity,
+           !config.validDistanceRangeCM.contains(sample.distanceCM) {
+            holdTracker.cancel()
+            captureState = .waitingForSubject
+            showCaptureRetryNotice(for: .movedTooMuch)
+            return
+        }
+        switch holdTracker.update(with: validity) {
+        case .progress(let remaining):
+            captureState = .holding(remainingSeconds: remaining)
+        case .completed(let meanCM, _):
+            // The captured value is the mean of the whole steady window — where the subject
+            // actually locked — recorded even though the protocol's target distance is fixed.
+            mutableSession.lockedDistanceCM = meanCM
+            captureState = .captured
+            showLockedConfirmation()
+            advanceToWarmup()
+        case .voided(let reason):
+            captureState = captureReadiness(validity)
+            showCaptureRetryNotice(for: reason)
+        case nil:
+            break
+        }
+    }
+
+    /// The Capture button is live only on a fresh IN-BAND reading. Gold enables it on any valid
+    /// sample (the user chooses their own test distance there); Myotect's target is fixed, so
+    /// capturing out of band would only walk the child into an immediate trial pause.
+    private func captureReadiness(_ validity: DistanceValidity) -> DistanceCaptureState {
+        if case .valid(let sample) = validity,
+           config.validDistanceRangeCM.contains(sample.distanceCM) {
+            return .ready
+        }
+        return .waitingForSubject
+    }
+
+    /// Lock-phase pill: directional guidance only. Once the subject is in band the enabled
+    /// Capture button speaks for itself (gold: the status row goes quiet in `.ready`).
+    private func updateLockPhaseGuidance(for status: DistanceStatus) {
+        okDismissTask?.cancel()
+        switch status {
+        case .tooFar:
+            guidance = .moveCloser
+        case .tooClose:
+            guidance = .moveFarther
+        case .noFace:
+            guidance = .warning(message: "I can't see you. Step back into view.")
+        case .holdSteady, .locked:
+            guidance = .hidden
+        }
+        // While a void notice is up, its spoken "try again" is playing — the announcer
+        // SUPERSEDES rather than queues, so a guidance prompt now would cut it off mid-word.
+        // Guidance speech resumes once the notice clears (~2.5 s), like gold's quiet screen.
+        guard captureRetryNotice == nil else { return }
+        speakGuidanceIfNeeded(for: status)
+    }
+
+    private func showCaptureRetryNotice(for reason: DistanceHoldTracker.VoidReason) {
+        let notice: String
+        let spoken: SpokenPrompt
+        switch reason {
+        case .movedTooMuch:
+            notice = "Moved too much — try again"
+            spoken = .movedTooMuch
+        case .faceLost:
+            notice = "Lost your face — try again"
+            spoken = .lostFace
+        }
+        captureRetryNotice = notice
+        announcer.speak(spoken)
+        captureRetryDismissTask?.cancel()
+        captureRetryDismissTask = Task { [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(
+                nanoseconds: UInt64(config.captureRetryNoticeSeconds * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self.captureRetryNotice = nil
+        }
+    }
+
+    private func clearCaptureRetryNotice() {
+        captureRetryDismissTask?.cancel()
+        captureRetryDismissTask = nil
+        captureRetryNotice = nil
+    }
+
+    /// Returns the capture flow to its starting point: any half-finished hold discarded, any
+    /// stale retry message cleared, the button back to waiting on a reading.
+    private func resetCaptureFlow() {
+        holdTracker.cancel()
+        clearCaptureRetryNotice()
+        captureState = .waitingForSubject
+    }
+
     /// Pauses the active presentation because distance can no longer be trusted (out of band,
     /// face lost, session interrupted/failed, or stale). The in-flight answer is invalidated
-    /// and the letter is HIDDEN — a child who walks up to the phone must never get to read the
-    /// letter that will be re-presented after re-lock (gold-standard rule).
+    /// and the letter is HIDDEN. This is deliberately stricter than the gold app, which keeps
+    /// the letter visible when merely out of band (hiding only on invalid tracking): a child
+    /// who walks up to the phone must never get to read the letter that will be re-presented
+    /// after re-lock.
     private func pauseForDistance(status: DistanceStatus) {
         isPausedForDistance = true
         currentStimulus = nil
@@ -657,7 +812,6 @@ final class MyopiaScreenCoordinator: ObservableObject {
     private func startCondition(_ condition: ColorCondition) {
         activeCondition = condition
         engine = AcuityStaircaseEngine(config: config.staircaseConfig(gated: condition == .highContrast))
-        trialNumber = 0
         if inputMode == .voice {
             capture?.beginCaptureSession()
         }
@@ -680,7 +834,6 @@ final class MyopiaScreenCoordinator: ObservableObject {
     private func presentTrial() {
         guard let condition = activeCondition, let engine else { return }
         currentLetter = SloanLetter.random(excluding: currentLetter)
-        trialNumber += 1
         // A fresh letter resets the retry budget; distance-pause repeats deliberately do not.
         retryPolicy.beginTrial()
         presentStimulus(letter: currentLetter,
@@ -887,7 +1040,9 @@ final class MyopiaScreenCoordinator: ObservableObject {
             distanceCM: responseDistanceCM,
             sizingDistanceCM: currentSizingDistanceCM,
             responseTimeMS: latencyMS,
-            trialNumber: trialNumber,
+            // Recorded BEFORE the engine consumes the response, so this is the 1-based
+            // within-level number of the trial being answered (gold `nextTrialNumber`).
+            trialNumber: engine?.nextTrialNumber ?? 0,
             timestamp: Date(),
             provenance: provenance)
         mutableSession.trials.append(trial)
@@ -998,12 +1153,14 @@ final class MyopiaScreenCoordinator: ObservableObject {
         listen()
     }
 
-    /// Sizing distance: a fresh valid sample, else the last one the provider vouched for. There
-    /// is deliberately no nominal-distance fallback.
+    /// Sizing distance: a fresh valid sample from the provider, or nothing — the presentation
+    /// pauses rather than size from an aged or assumed distance (gold rule: never size from a
+    /// sample older than `maximumSampleAgeSeconds`). There is deliberately no nominal-distance
+    /// fallback either.
     private func sizedSpec(acuity: Int) -> OptotypeRenderSpec? {
         guard let cal = sessionCalibration else { return nil }
-        guard let distanceCM = distance.validSample(maximumAge: config.maximumSampleAgeSeconds)?.distanceCM
-            ?? lastValidSample?.distanceCM else { return nil }
+        guard let distanceCM = distance.validSample(
+            maximumAge: config.maximumSampleAgeSeconds)?.distanceCM else { return nil }
         guard let font = try? OptotypeSizing.sloanBaseFont(),
               let spec = try? OptotypeSizing.renderSpec(
                   distanceCM: distanceCM,

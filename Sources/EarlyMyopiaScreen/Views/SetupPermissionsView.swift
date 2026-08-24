@@ -53,6 +53,13 @@ struct SetupPermissionsView: View {
 
     private var modelPrepFraction: Double? {
         guard !usingMocks, case .preparing(let phase)? = whisper.modelState else { return nil }
+        // The download is the one long, measurable phase: interpolate its live fraction toward
+        // the next phase's baseline so the bar moves through the whole ~140 MB fetch.
+        if phase == .downloading {
+            let next = WhisperKitLetterRecognitionService.ModelPrepPhase.initializing.fraction
+            let span = next - phase.fraction
+            return phase.fraction + span * min(max(whisper.downloadFraction, 0), 1)
+        }
         return phase.fraction
     }
 
@@ -94,8 +101,16 @@ struct SetupPermissionsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                Text("Early Myopia Screen")
-                    .font(.largeTitle.bold())
+                // Gold two-line screen title: 36pt bold black over a kerned magenta caps line.
+                VStack(spacing: 4) {
+                    Text("Early Myopia Screen")
+                        .myoScreenTitle()
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                    Text("Screening Setup")
+                        .myoTestTypeTitle()
+                }
+                .frame(maxWidth: .infinity)
 
                 instructions
 
@@ -109,6 +124,12 @@ struct SetupPermissionsView: View {
                     statusRow("Display fits protocol letters", ok: displayFits)
                 }
 
+                // Informational, not a gate: the contrast the captured config will actually run
+                // (the coordinator froze it at flow launch — not the live Settings value).
+                Text("Low contrast: \(Int((coordinator.config.lowContrastWeber * 100).rounded()))% Weber")
+                    .font(.footnote)
+                    .foregroundStyle(Color.myoGrayText)
+
                 if !isCalibrated {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("This display is not in the verified device database. A one-time ruler measurement is required before testing.")
@@ -116,39 +137,42 @@ struct SetupPermissionsView: View {
                             .foregroundStyle(.secondary)
                         Button("Calibrate screen") { showCalibrationSheet = true }
                             .buttonStyle(.bordered)
+                            .tint(.myoActionBlue)
                     }
                 }
 
                 if !faceTrackingSupported {
                     Text("This device does not support front-camera face tracking, which is required to measure distance.")
                         .font(.footnote)
-                        .foregroundStyle(.red)
+                        .foregroundStyle(Color.myoDestructive)
                 }
 
                 if !FontRegistrar.sloanAvailable {
                     Text("The Sloan optotype font failed to load; the test cannot render valid letters.")
                         .font(.footnote)
-                        .foregroundStyle(.red)
+                        .foregroundStyle(Color.myoDestructive)
                 }
 
                 if let fitProblem = coordinator.displayFitProblem {
                     Text(fitProblem)
                         .font(.footnote)
-                        .foregroundStyle(.red)
+                        .foregroundStyle(Color.myoDestructive)
                 }
 
                 if let fraction = modelPrepFraction {
                     ProgressView(value: fraction)
                         .progressViewStyle(.linear)
+                        .tint(.myoTeal)
                 }
 
                 if !usingMocks, case .failed(let message) = whisper.modelState {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Speech model error: \(message)")
                             .font(.footnote)
-                            .foregroundStyle(.red)
+                            .foregroundStyle(Color.myoDestructive)
                         Button("Retry loading") { coordinator.retryWhisperModelPreparation() }
                             .buttonStyle(.bordered)
+                            .tint(.myoActionBlue)
                     }
                 }
 
@@ -163,11 +187,12 @@ struct SetupPermissionsView: View {
                             }
                         }
                         .buttonStyle(.bordered)
+                        .tint(.myoActionBlue)
                     }
                 }
 
                 Button("Begin") { coordinator.beginAfterSetup() }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.myoPrimary)
                     .disabled(!canBegin)
                     .frame(maxWidth: .infinity)
                     .padding(.top, 8)
@@ -176,12 +201,15 @@ struct SetupPermissionsView: View {
                     Button("Continue with clinician keypad") {
                         coordinator.beginAfterSetup(startInManualMode: true)
                     }
-                    .buttonStyle(.bordered)
+                    // Flexible width: this title is the app's longest and sits exactly at the
+                    // 242pt style's scale floor — let it size to its content instead.
+                    .buttonStyle(MyoPrimaryButtonStyle(background: .myoActionBlue, width: nil))
                     .frame(maxWidth: .infinity)
                 }
             }
             .padding()
         }
+        .decorativeDaisies(.myoContentDaisies, over: .white)
         .onAppear(perform: requestPermissions)
         .sheet(isPresented: $showCalibrationSheet) {
             ScreenCalibrationView(provider: calibrationModel.provider)
@@ -189,26 +217,37 @@ struct SetupPermissionsView: View {
     }
 
     private var instructions: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("Place the phone on a stable stand with the screen facing the child.", systemImage: "iphone")
-            Label("Have the child stand or sit about 2 meters away.", systemImage: "figure.stand")
-            Label("The app will guide you closer or farther.", systemImage: "arrow.left.and.right")
-            Label("Say each letter out loud when it appears.", systemImage: "mic")
-            Text("This is a research screening test and does not diagnose an eye condition.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .padding(.top, 4)
+        // Gold card treatment; body stays 16-18pt (not the 30pt drawInstruction — these lines
+        // are long) with teal-tinted icons.
+        MyoCard {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Place the phone on a stable stand with the screen facing the child.", systemImage: "iphone")
+                Label("Have the child stand or sit about 2 meters away.", systemImage: "figure.stand")
+                Label("The app will guide you closer or farther.", systemImage: "arrow.left.and.right")
+                Label("Say each letter out loud when it appears.", systemImage: "mic")
+                Text("This is a research screening test and does not diagnose an eye condition.")
+                    .font(.footnote)
+                    .foregroundStyle(Color.myoGrayText)
+                    .padding(.top, 4)
+            }
+            .font(.callout)
+            .foregroundStyle(Color.black)
+            .tint(.myoTeal)
         }
-        .font(.callout)
     }
 
     private func statusRow(_ title: String, ok: Bool) -> some View {
+        // Gold Settings-row treatment: gray surface, radius 8.
         HStack {
             Image(systemName: ok ? "checkmark.circle.fill" : "circle")
-                .foregroundStyle(ok ? .green : .secondary)
+                .foregroundStyle(ok ? Color.myoOkGreen : Color.myoGrayText)
             Text(title)
+                .foregroundStyle(Color.black)
             Spacer()
         }
+        .padding(.horizontal, 12)
+        .frame(minHeight: 44)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.myoSurface))
     }
 
     private func requestPermissions() {
@@ -250,13 +289,19 @@ private final class CalibrationStatusModel: ObservableObject {
 /// view can observe `modelState` through a non-optional `@ObservedObject`. Nil under mocks.
 private final class WhisperModelObserver: ObservableObject {
     @Published private(set) var modelState: WhisperKitLetterRecognitionService.ModelState?
-    private var cancellable: AnyCancellable?
+    /// Mirrors the service's download progress (meaningful only in `.preparing(.downloading)`).
+    @Published private(set) var downloadFraction: Double = 0
+    private var cancellables: [AnyCancellable] = []
 
     @MainActor
     init(_ service: WhisperKitLetterRecognitionService?) {
         self.modelState = service?.modelState
-        cancellable = service?.$modelState.sink { [weak self] state in
+        self.downloadFraction = service?.downloadFraction ?? 0
+        service?.$modelState.sink { [weak self] state in
             self?.modelState = state
-        }
+        }.store(in: &cancellables)
+        service?.$downloadFraction.sink { [weak self] fraction in
+            self?.downloadFraction = fraction
+        }.store(in: &cancellables)
     }
 }

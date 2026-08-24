@@ -187,23 +187,17 @@ enum OptotypeSizing {
 
     /// Half-physical-pixel damping for live re-sizing: re-render only when the candidate height
     /// moved at least half a physical pixel from what is on screen, or when the calibration
-    /// identity (screen signature, source, points-per-millimeter, schema version) changed —
-    /// a stale calibration must never keep damping a stimulus sized under new assumptions.
+    /// changed in ANY field — a stale calibration must never keep damping a stimulus sized under
+    /// new assumptions. Full-equality comparison and the CANDIDATE's half-pixel threshold, exactly
+    /// as in the gold `OptotypeSizing.needsRender`.
     static func needsRender(
         previousSpec: OptotypeRenderSpec?,
         candidateSpec: OptotypeRenderSpec,
         force: Bool = false
     ) -> Bool {
         guard !force, let previousSpec else { return true }
-        let previous = previousSpec.calibration
-        let candidate = candidateSpec.calibration
-        guard previous.screenSignature == candidate.screenSignature,
-              previous.source == candidate.source,
-              previous.pointsPerMillimeter == candidate.pointsPerMillimeter,
-              previous.schemaVersion == candidate.schemaVersion else {
-            return true
-        }
+        guard previousSpec.calibration == candidateSpec.calibration else { return true }
         return abs(candidateSpec.renderedHeightPoints - previousSpec.renderedHeightPoints)
-            >= previous.halfPhysicalPixelInPoints
+            >= candidateSpec.calibration.halfPhysicalPixelInPoints
     }
 }

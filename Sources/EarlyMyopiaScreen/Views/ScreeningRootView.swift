@@ -13,8 +13,9 @@ struct ScreeningRootView: View {
     private let calibrationProvider: ScreenCalibrationProviding
     private let usingMocks: Bool
 
-    init() {
-        let config = ScreenConfig()
+    /// `config` carries the operator-adjustable settings (contrast, TTS) sampled by the caller
+    /// at presentation time; the coordinator freezes it for the whole session.
+    init(config: ScreenConfig = ScreenConfig()) {
         // Calibration owns the pixels→points→millimeters conversion (built on nativeScale, so
         // downsampled Plus-class displays size correctly). DevicePpi resolves in the simulator
         // too, so the real provider serves both branches; unknown devices go through the manual
@@ -60,6 +61,7 @@ struct ScreeningRootView: View {
 
     var body: some View {
         content
+            .preferredColorScheme(.light)
             .overlay(alignment: .topLeading) { backButton }
             .overlay(alignment: .topTrailing) { nextButton }
             .onChange(of: scenePhase) { _, newPhase in
@@ -109,8 +111,7 @@ struct ScreeningRootView: View {
                 if !coordinator.goBack() { dismiss() }
             } label: {
                 Label("Back", systemImage: "chevron.left")
-                    .padding(8)
-                    .background(.ultraThinMaterial, in: Capsule())
+                    .modifier(MyoFlowCapsule())
             }
             .padding()
         }
@@ -127,8 +128,7 @@ struct ScreeningRootView: View {
             } label: {
                 Label("Next", systemImage: "chevron.right")
                     .labelStyle(.titleAndIcon)
-                    .padding(8)
-                    .background(.ultraThinMaterial, in: Capsule())
+                    .modifier(MyoFlowCapsule())
             }
             .padding()
         }
@@ -171,14 +171,33 @@ struct ScreeningRootView: View {
             VStack(spacing: 16) {
                 Image(systemName: "exclamationmark.triangle")
                     .font(.system(size: 64))
-                    .foregroundStyle(.orange)
-                Text("Screening stopped")
-                    .font(.title.bold())
+                    .foregroundStyle(Color.myoDestructive)
+                Text("Screening Stopped")
+                    .myoHeader()
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
                 Text(reason)
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 20))
+                    .foregroundStyle(Color.myoGrayText)
                     .multilineTextAlignment(.center)
             }
             .padding()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .decorativeDaisies(.myoContentDaisies, over: .white)
         }
+    }
+}
+
+/// The flow's Back/Next chrome: a light capsule that reads over both the white setup screens
+/// and the black trial field (gold card border + soft shadow, teal label).
+private struct MyoFlowCapsule: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .font(.system(size: 17, weight: .semibold))
+            .foregroundStyle(Color.myoTeal)
+            .padding(8)
+            .background(Capsule().fill(Color.white.opacity(0.92)))
+            .overlay(Capsule().strokeBorder(Color.myoGrayBorder.opacity(0.55), lineWidth: 1))
+            .shadow(color: .black.opacity(0.08), radius: 18, y: 8)
     }
 }
