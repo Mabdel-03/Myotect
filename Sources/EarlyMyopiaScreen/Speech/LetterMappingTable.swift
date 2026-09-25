@@ -4,10 +4,17 @@ import Foundation
 enum RecognitionOutcome: Equatable {
     /// A single, unambiguous Sloan letter.
     case letter(String)
+    /// The child said they cannot see the letter ("skip" and its Whisper mis-hearings —
+    /// ``LetterMappingTable/skipPhrases``). Resolves the trial like a letter does: scored as a
+    /// miss, never retried.
+    case skipped
     /// The transcript matched more than one distinct Sloan letter. Repeat the trial.
     case ambiguous
     /// Nothing usable was recognized. The payload says *why*, so the operator can tell
-    /// "heard mumbling" from "heard nothing". Repeat the trial.
+    /// "heard mumbling" from "heard nothing". `.filler` / `.unintelligible` repeat the trial;
+    /// `.silence` on the scored voice path is recorded as a "no input registered" row that does
+    /// not count toward the staircase and is replaced by a fresh letter
+    /// (`MyopiaScreenCoordinator.handleScoredOutcome`).
     case unrecognized(NonAnswerKind)
     /// The recognition service itself is broken (permissions, model, capture). Structural —
     /// repeating the letter cannot fix it, so never retry-loop this outcome; surface it and
@@ -19,7 +26,10 @@ enum RecognitionOutcome: Equatable {
 /// `isIgnorableNonAnswer` distinction so downstream handling can distinguish an engaged child
 /// from a dead microphone.
 enum NonAnswerKind: Equatable {
-    /// No/near-no audio, or a silence-hallucination transcript ("thank you").
+    /// No usable speech in the whole listening window from an armed microphone: no/near-no
+    /// audio, or only a silence-hallucination transcript ("thank you"). The Whisper service
+    /// substitutes any filler/unintelligible/ambiguous pass heard earlier in the trial
+    /// (``RecognitionFlushRules``), so this never means merely "the tail was quiet".
     case silence
     /// "um", "uh" — the child is engaged but hasn't answered yet.
     case filler
@@ -84,6 +94,21 @@ enum LetterMappingTable {
         "vie": "V",
     ]
 
+    /// Spoken "skip" and the whole-word forms Whisper produces for it. A skip resolves the trial
+    /// as a MISS, so the list is deliberately conservative: a false skip costs a scored letter, a
+    /// missed skip costs only a retry. Entries are already normalized (lowercase, letters only)
+    /// and must never collide with a letter table or a `WhisperTranscriptFilter` set — pinned by
+    /// `testSkipPhrasesNeverCollideWithLetterTables`.
+    ///
+    /// Deliberately NOT included until device logs justify them ("tier 2"): "ski", "kip", "skit",
+    /// "skid", "skiff". Each is a short real word Whisper could also produce by fusing an "S… K"
+    /// self-correction, which today classifies `.ambiguous` (retry) and would become a scored
+    /// miss. "skype" is the tier-1 entry to watch for the same reason.
+    static let skipPhrases: Set<String> = [
+        "skip", "skipp", "skiip", "skipped", "skips", "skipping", "skippy", "skype",
+        "scip", "skep", "skup",
+    ]
+
     /// Normalizes a raw transcript: lowercased, with every non-letter run replaced by a single
     /// space (gold `cleanedTranscriptToken`: `[^A-Z]+` → " "). Replacing with a space rather than
     /// deleting keeps punctuation-joined words apart — "C-D" must become the two tokens "c d"
@@ -123,9 +148,11 @@ enum LetterMappingTable {
         return nil
     }
 
-    /// Classifies a transcript that may contain one or more words. If distinct Sloan letters are
-    /// detected, returns `.ambiguous`; a single letter returns `.letter`; otherwise `.unrecognized`
-    /// (`.silence` for blank text, `.unintelligible` for speech that mapped to no letter).
+    /// Classifies a transcript that may contain one or more words. Distinct Sloan letters →
+    /// `.ambiguous`; a single letter → `.letter`; a skip word with no letter → `.skipped`; a skip
+    /// word WITH a letter ("c skip"; "okay skip", because "okay" is a K correction) →
+    /// `.ambiguous` — a mixed utterance retries rather than guesses; otherwise `.unrecognized`
+    /// (`.silence` for blank text, `.unintelligible` for speech that mapped to nothing).
     static func classify(_ raw: String) -> RecognitionOutcome {
         let text = normalize(raw)
         guard !text.isEmpty else { return .unrecognized(.silence) }
@@ -134,19 +161,23 @@ enum LetterMappingTable {
         if let single = letter(forTranscript: text) {
             return .letter(single)
         }
+        if skipPhrases.contains(text) { return .skipped }
 
-        // Otherwise scan tokens and collect distinct Sloan letters.
+        // Otherwise scan tokens: collect distinct Sloan letters and note any skip word.
         let tokens = text.split(whereSeparator: { $0 == " " }).map(String.init)
         var found = Set<String>()
+        var sawSkip = false
         for token in tokens {
             if let letter = letter(forTranscript: token) {
                 found.insert(letter)
+            } else if skipPhrases.contains(token) {
+                sawSkip = true
             }
         }
 
         switch found.count {
-        case 0: return .unrecognized(.unintelligible)
-        case 1: return .letter(found.first!)
+        case 0: return sawSkip ? .skipped : .unrecognized(.unintelligible)
+        case 1: return sawSkip ? .ambiguous : .letter(found.first!)
         default: return .ambiguous
         }
     }

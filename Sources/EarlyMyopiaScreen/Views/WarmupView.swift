@@ -9,7 +9,7 @@ struct WarmupView: View {
 
     var body: some View {
         ZStack {
-            AcuityTrialView(coordinator: coordinator, clinician: clinician)
+            AcuityTrialView(coordinator: coordinator, clinician: clinician, showsHeardLine: false)
 
             VStack {
                 MyoPillChrome(preset: .holdSteady) {
@@ -23,6 +23,10 @@ struct WarmupView: View {
                             .foregroundStyle(Color.myoTeal)
                     }
                 }
+                // The operator "Heard" line lives here rather than in the trial view's default
+                // top slot, which the warm-up pill already occupies.
+                HeardDiagnosticLine(coordinator: coordinator)
+                    .padding(.top, 8)
                 Spacer()
             }
             .padding(.top, 24)

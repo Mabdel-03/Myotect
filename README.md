@@ -41,20 +41,37 @@ setup → distanceLock → warmup → highContrastGate → lowContrast(×2) → 
    **2.0 s steady hold** (any reading drifting more than **±4 cm** from the tap-instant anchor, or
    losing the face, voids the hold with a spoken "try again"), and the mean of the hold window is
    recorded as `lockedDistanceCM`. Only hold completion advances — steady standing alone never does.
-3. **Warm-up** — 5 unscored high-contrast letters at 20/80, so the child learns the task.
-4. **High-contrast gate** — a black-on-white acuity staircase. The child must reach **20/25** to
-   continue. Failing the gate ends the session with `interpretation = "highContrastBelowGate"`.
-5. **Low contrast (duochrome)** — if the gate passes, the two low-contrast conditions run in
-   **randomized order** at **10 % Weber contrast** by default (operator-selectable 5 / 10 / 15 %
-   in Settings): dark-red-on-red and dark-teal-on-teal.
+3. **Warm-up** — 5 unscored high-contrast letters at 20/80, so the child learns the task. Before
+   warm-up the OPERATOR briefs the child: *"If you cannot see the letter, say 'skip'."* No spoken
+   prompt mentions skip.
+4. **High-contrast acuity** — a black-on-white acuity staircase. Whether the child reached
+   **20/25** is recorded as `reachedGate` on the result; it is an analysis field only and never
+   stops the session.
+5. **Low contrast (duochrome)** — the two low-contrast conditions always run, in **randomized
+   order** at **20 % nominal sRGB-channel Weber contrast** by default (operator-selectable
+   5 / 10 / 15 / 20 % in Settings): dark-red-on-red and dark-teal-on-teal. Each starts two rungs
+   coarser than the finest high-contrast line passed, clamped to 20/200.
 6. **Results** — the session is written to disk as JSON + CSV, including
    `duochromeDeltaLogMAR = green.logMAR − red.logMAR`.
 
 Throughout, the app speaks short patient-facing prompts ("Say the letter you see.", "Move closer.",
 "All done. Great job!"). Recognition never runs while the app is speaking, and repeated guidance is
-throttled so it cannot become a chant. A trial that keeps failing to produce an answer gets a bounded
-number of same-letter retries and then escalates to a clinician keypad — a dead microphone can never
-cause a silent infinite loop.
+throttled so it cannot become a chant. A child who cannot see the letter says **"skip"**: scored as
+an incorrect trial, and the next letter follows. A scored trial with **no speech-length sound for
+~10 s** from an armed microphone (a soft window that never cuts off an answer in progress) is
+recorded as an incorrect `no input registered` row that does **not** count toward the staircase —
+the level does not move and a fresh letter takes its place; after **three consecutive** no-input
+trials the next letter goes to the clinician keypad as a backstop. An ambiguous, filler, or
+unintelligible answer gets a bounded number of same-letter retries and then escalates to the
+keypad — a dead microphone or a silent child can never cause a silent infinite loop, and silence
+can never fail a line. In voice mode the operator holding the phone sees a one-line "Heard"
+readout at the top of the trial screen (what the recognizer transcribed and how it classified it),
+too small to read from 2 m and never a scoring input.
+
+The operator's **Next** control on a scored condition (high contrast, low-contrast red, low-contrast
+teal) asks *"Skip this test?"* before skipping; Cancel leaves the trial exactly as it was. A skipped
+condition has no result and the results screen shows **Skipped** for it. Next on distance lock and
+warm-up is still immediate.
 
 The acuity staircase runs the ETDRS five-letter protocol (matching the reference app's
 `ETDRSProgressionEngine`): 5 trials per level, advancing on ≥ 3 correct (or immediately when the
@@ -82,6 +99,15 @@ truly the size it says it was:
   chatter.
 - **Live re-sizing is damped to half a physical pixel,** and a damped candidate never overwrites the
   visible spec — so recorded provenance always describes what was actually on screen.
+- **All three scored conditions always run.** Whether the high-contrast staircase reached 20/25 is
+  recorded as `reachedGate` on the result; it is never a flow branch.
+- **A scored condition is dropped only by a confirmed operator skip.** No-input trials, a
+  below-gate high-contrast result, or a distance pause can never drop a condition on their own.
+- **A trial nobody answered never moves the staircase.** A voice no-input is logged
+  (`countsTowardStaircase = false`) and replaced by a fresh letter at the same level; only spoken
+  letters, spoken skips, and keypad entries are fed to the engine — and the recognizer reports
+  silence only when its own voice trace held no speech-length sound, so a child who spoke retries
+  instead of being logged as absent.
 
 ---
 
@@ -172,14 +198,16 @@ Myotect/
 │       │                        DistanceBandGate, DistanceGuidanceState,
 │       │                        ARKitDistanceProvider, MockDistanceProvider
 │       ├── Speech/              LetterRecognitionService, LetterMappingTable,
-│       │                        WhisperKitLetterRecognitionService,
-│       │                        ManualClinicianService, MockLetterRecognitionService
+│       │                        WhisperKitLetterRecognitionService, ListeningBufferRules,
+│       │                        CaptureSampleStore, ManualClinicianService,
+│       │                        MockLetterRecognitionService
 │       ├── Audio/               SpeechAnnouncer (patient-facing TTS), PromptThrottle
-│       ├── Coordinator/         ScreenConfig, MyopiaScreenCoordinator, RetryEscalationPolicy
+│       ├── Coordinator/         ScreenConfig, MyopiaScreenCoordinator, RetryEscalationPolicy,
+│       │                        HeardDiagnosticFormatter
 │       └── Views/               ScreeningRootView + one view per phase, OptotypeView,
-│                                DistanceGuidancePill, ScreenCalibrationView, ResultsView,
-│                                PreviousResultsView
-└── Tests/                       174 XCTest unit tests across 18 files
+│                                DistanceGuidancePill, HeardDiagnosticLine, ScreenCalibrationView,
+│                                ResultsView, PreviousResultsView
+└── Tests/                       324 XCTest unit tests across 27 files
 ```
 
 Architecture is SwiftUI-first. ARKit/UIKit are isolated to the distance provider; all protocol logic
@@ -194,7 +222,8 @@ retrievable via Finder or the Files app:
 
 - `<sessionID>.json` — the complete session record, including the calibration in force and
   per-trial sizing provenance.
-- `<sessionID>.csv` — one header row plus one row per scored trial (19 columns).
+- `<sessionID>.csv` — one header row plus one row per recorded trial (20 columns;
+  `counts_toward_staircase` separates the rows the staircase consumed from uncounted no-input rows).
 
 By default **no raw audio buffers and no face geometry are persisted** — only the derived
 eye-to-screen distance scalar per trial. `ScreenConfig.persistRawSignals` is `false` by default and
@@ -236,7 +265,7 @@ line.
 
 ## Status
 
-The unit suite is **green: 174 tests, 0 failures** (iPhone 16 Pro / iOS 18.2, ~0.7 s).
+The unit suite is **green: 324 tests, 0 failures** (iPhone 17 / iOS 26.5, ~3 s).
 
 Behavior that still requires validation on physical hardware — ARKit distance stability at 2 m,
 audio-session coexistence between WhisperKit, the TTS announcer, and face tracking, and real

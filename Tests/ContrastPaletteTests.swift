@@ -17,15 +17,21 @@ final class ContrastPaletteTests: XCTestCase {
     }
 
     func testWeberFifteenPercent() {
-        // 15% is a protocol-selectable value (Settings: 5/10/15%).
+        // 15% is a protocol-selectable value (Settings: 5/10/15/20%).
         XCTAssertEqual(ContrastPalette.stimulusBrightness(background: 1.0, weber: 0.15), 0.85, accuracy: 1e-9)
     }
 
-    func testContrastConfigDefaultIsTenPercent() {
-        // The protocol default is 10% Weber; the type default is pinned deliberately so it can
-        // never silently drift from `ScreenConfig.lowContrastWeber`.
-        XCTAssertEqual(ContrastConfig().weber, 0.10, accuracy: 1e-9)
-        XCTAssertEqual(ScreenConfig().lowContrastWeber, 0.10, accuracy: 1e-9)
+    func testWeberTwentyPercent() {
+        // 20% is the protocol default (nominal sRGB-channel contrast).
+        XCTAssertEqual(ContrastPalette.stimulusBrightness(background: 1.0, weber: 0.20), 0.80, accuracy: 1e-9)
+    }
+
+    func testContrastConfigDefaultIsTwentyPercent() {
+        // The protocol default is 20% Weber; the type default is pinned deliberately so it can
+        // never silently drift from `ScreenConfig.lowContrastWeber` or the settings default.
+        XCTAssertEqual(ContrastConfig().weber, 0.20, accuracy: 1e-9)
+        XCTAssertEqual(ScreenConfig().lowContrastWeber, 0.20, accuracy: 1e-9)
+        XCTAssertEqual(WeberContrastChoice.defaultChoice.rawValue, 0.20, accuracy: 1e-9)
     }
 
     func testHighContrastIsBlackOnWhite() {

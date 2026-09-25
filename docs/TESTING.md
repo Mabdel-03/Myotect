@@ -1,11 +1,11 @@
 # Testing Myotect — complete guide
 
 This document covers everything needed to verify Myotect: the automated unit suite (how to run it,
-what every one of its 220 tests asserts), the manual on-device protocol for the parts a simulator
+what every one of its 324 tests asserts), the manual on-device protocol for the parts a simulator
 cannot exercise, physical verification of optotype size, and troubleshooting for the failure modes
 this project actually hits.
 
-**Current status: 220 tests, 0 failures** on iPhone 17 / iOS 26.5.
+**Current status: 324 tests, 0 failures** on iPhone 17 / iOS 26.5.
 
 **Contents**
 
@@ -29,8 +29,10 @@ this project actually hits.
 | Network (first build only) | SPM resolves `DevicePpi` and `argmax-oss-swift` |
 | A TrueDepth device | Only for [Part 3](#part-3--on-device-validation); not needed for the unit suite |
 
-Nothing else. The unit suite has no external fixtures, no network access, and no simulator UI
-automation — it is pure XCTest against injected mocks and completes in **under one second**.
+Nothing else. The unit suite has no fixtures other than the service source pin
+(`WhisperServiceSourcePinsTests` reads `WhisperKitLetterRecognitionService.swift` as text via
+`#filePath`), no network access, and no simulator UI automation — it is pure XCTest against
+injected mocks and completes in a **few seconds**.
 
 ### The one rule that will bite you
 
@@ -64,7 +66,7 @@ xcodebuild -project Myotect.xcodeproj -scheme Myotect \
 Expected tail on a green run:
 
 ```
-Executed 220 tests, with 0 failures (0 unexpected)
+Executed 324 tests, with 0 failures (0 unexpected)
 ** TEST SUCCEEDED **
 ```
 
@@ -96,7 +98,7 @@ declaration `xcodebuild` finds no scheme and falls back to the device placeholde
 xcodebuild ... test -only-testing:MyotectTests/AcuityStaircaseEngineTests
 
 # One test method
-xcodebuild ... test -only-testing:MyotectTests/CoordinatorGateTests/testGateFailSkipsLowContrast
+xcodebuild ... test -only-testing:MyotectTests/CoordinatorGateTests/testBelowGateHighContrastStillRunsBothLowContrastConditions
 
 # Everything except one class
 xcodebuild ... test -skip-testing:MyotectTests/CoordinatorGateTests
@@ -151,7 +153,8 @@ A bare `-target` build sees the simulator but cannot resolve SPM modules (`Devic
 | Every unit test (all pure logic) | ARKit face tracking / real distance |
 | The full phase flow via `MockDistanceProvider` + `MockLetterRecognitionService` | Live microphone capture |
 | Sizing math, calibration, staircase, persistence | WhisperKit model load + real speech accuracy |
-| Back/Next navigation, pause/resume policy | Brightness lock/restore |
+| The recognizer's listening rules and sample store (`ListeningBufferRulesTests`, `CaptureSampleStoreTests`, `RecognitionFlushRulesTests` — when a pass runs, how the consumed pointer and the soft deadline move, what the voice trace says) | WhisperKit's tap feeding the store, the real voice trace at 2 m, and the `[Whisper]` log lines that prove it (Part 3 § 3.5) |
+| Back/Next navigation (the coordinator's skip), pause/resume policy | Brightness lock/restore; the Next "Skip this test?" confirmation dialog (UI-only, in `ScreeningRootView`) |
 | Setup gating logic | Audio-session coexistence with ARKit |
 
 In the simulator `ARFaceTrackingConfiguration.isSupported` is false, so `ScreeningRootView` swaps in
@@ -162,40 +165,61 @@ shown. That runs a clean pass end-to-end without a microphone.
 
 ## Part 2 — The unit suite, test by test
 
-**220 tests across 20 files.** All are `XCTest`, synchronous or `@MainActor`, and deterministic —
+**324 tests across 27 files.** All are `XCTest`, synchronous or `@MainActor`, and deterministic —
 no `Date.now` dependence in assertions, no randomness (condition order is injected via
-`lowContrastOrderOverride`), no sleeps.
+`lowContrastOrderOverride`), no sleeps. (`grep -c 'func test' Tests/*.swift` sums to 325: the extra
+hit is `CoordinatorGateTests.testCalibration(pointsPerMillimeter:)`, a static fixture helper that
+XCTest does not run.)
 
 | File | Tests | Under test |
 | --- | ---: | --- |
-| [CoordinatorGateTests](#coordinatorgatetests--38-tests) | 38 | `MyopiaScreenCoordinator` — the whole state machine, incl. the operator capture hold and config→session contrast |
+| [CoordinatorGateTests](#coordinatorgatetests--54-tests) | 54 | `MyopiaScreenCoordinator` — the whole state machine, incl. the operator capture hold, config→session contrast, the no-input window and the uncounted no-input rule, the low-contrast starting level, the below-gate flow and confirmed skips, and the inter-stimulus blank |
 | [DistanceModelsTests](#distancemodelstests--28-tests) | 28 | Sample validity, validity resolution, emission throttle |
 | [AcuityStaircaseEngineTests](#acuitystaircaseenginetests--21-tests) | 21 | ETDRS five-letter staircase: advance/step-back/terminations/gate/two-terminal logMAR |
-| [LetterMappingTableTests](#lettermappingtabletests--14-tests) | 14 | Transcript → Sloan letter mapping + normalization |
+| [LetterMappingTableTests](#lettermappingtabletests--19-tests) | 19 | Transcript → Sloan letter mapping, normalization, spoken skip |
+| [CoordinatorRetryTests](#coordinatorretrytests--22-tests) | 22 | Retry → keypad escalation, spoken skip, uncounted no-input rows and their backstop, end to end |
+| [ScreenConfigTests](#screenconfigtests--17-tests) | 17 | Ladder arithmetic for the low-contrast start, staircase-config factory, protocol and listening defaults, `init(settings:)` |
+| [ScreeningSettingsProviderTests](#screeningsettingsprovidertests--13-tests) | 13 | Operator settings store: defaults, round trips, self-invalidation, notifications, v1 → v2 upgrade |
+| [ListeningBufferRulesTests](#listeningbufferrulestests--16-tests) | 16 | The pure listening-buffer rules behind the WhisperKit service: voice trace, when a pass runs, consumed pointer, flush span, carried-over voice, soft deadline |
 | [ScreenCalibrationProviderTests](#screencalibrationprovidertests--12-tests) | 12 | Auto + manual calibration, invalidation |
+| [SessionStoreTests](#sessionstoretests--12-tests) | 12 | JSON/CSV encoding, quoting, weber and counts-toward-staircase columns, legacy rows, delta, load ordering, delete-all |
 | [DistanceBandGateTests](#distancebandgatetests--10-tests) | 10 | Pause/resume hysteresis |
-| [WhisperTranscriptFilterTests](#whispertranscriptfiltertests--9-tests) | 9 | Filler / silence-hallucination rejection |
+| [WhisperTranscriptFilterTests](#whispertranscriptfiltertests--10-tests) | 10 | Filler / silence-hallucination rejection; skip and hesitant answers pass through |
 | [OptotypeSizingTests](#optotypesizingtests--9-tests) | 9 | Physical sizing math and render damping |
 | [DistanceHoldTrackerTests](#distanceholdtrackertests--9-tests) | 9 | Operator-initiated capture hold (anchor, tolerance, countdown, mean) |
-| [CoordinatorRetryTests](#coordinatorretrytests--9-tests) | 9 | Retry → keypad escalation, end to end |
+| [ContrastPaletteTests](#contrastpalettetests--9-tests) | 9 | Weber contrast (5/10/15/20 %), the 20 % default, channel isolation |
 | [SizingProvenanceTests](#sizingprovenancetests--8-tests) | 8 | Provenance matching and Codable round-trips |
-| [RetryEscalationPolicyTests](#retryescalationpolicytests--8-tests) | 8 | The escalation state machine in isolation |
-| [SessionStoreTests](#sessionstoretests--7-tests) | 9 | JSON/CSV encoding, quoting, weber column, delta, load ordering, delete-all |
-| [ContrastPaletteTests](#contrastpalettetests--6-tests) | 8 | Weber contrast (5/10/15%), defaults, channel isolation |
-| [CoordinatorTTSTests](#coordinatorttstests--6-tests) | 6 | Spoken prompts wired into the flow |
+| [RetryEscalationPolicyTests](#retryescalationpolicytests--9-tests) | 9 | The escalation state machine in isolation |
+| [CoordinatorTTSTests](#coordinatorttstests--10-tests) | 10 | Spoken prompts wired into the flow |
+| [RecognitionFlushRulesTests](#recognitionflushrulestests--7-tests) | 7 | The pure outcome rules of the WhisperKit service's deadline flush: engagement, trace-upgraded silence |
 | [ARKitDistanceProviderTests](#arkitdistanceprovidertests--5-tests) | 5 | Smoothing and plausibility rejection |
 | [SpeechAnnouncerTests](#speechannouncertests--5-tests) | 5 | Utterance lifecycle and completion-exactly-once |
+| [IdleTimerControllerTests](#idletimercontrollertests--5-tests) | 5 | Display-sleep lock and restore |
 | [PromptThrottleTests](#promptthrottletests--4-tests) | 4 | Repeat-prompt throttling |
-| [ScreeningSettingsProviderTests](#screeningsettingsprovidertests--7-tests) | 7 | Operator settings store: defaults, round trips, self-invalidation, notifications |
+| [CaptureSampleStoreTests](#capturesamplestoretests--4-tests) | 4 | The recognizer's own sample store: block-complete cue, absolute indices across purges, clamped copies |
+| [HeardDiagnosticFormatterTests](#hearddiagnosticformattertests--4-tests) | 4 | The operator "Heard" line's wording, one test per diagnostic kind |
+| [WhisperServiceSourcePinsTests](#whisperservicesourcepinstests--1-test) | 1 | Source pin: the service never reads WhisperKit's buffer or its voice heuristic |
 | [MyotectTests](#myotecttests--1-test) | 1 | Placeholder |
 
-### ScreeningSettingsProviderTests — 7 tests
+### ScreeningSettingsProviderTests — 13 tests
 
-Pins the operator-settings store (`ScreeningSettingsProvider`): empty defaults → 10% Weber +
-audio on; save/read round trips for every 5/10/15% × audio combination; garbage, schema-mismatch,
-and disallowed-weber records return defaults AND delete themselves; save/reset post
-`.screeningSettingsDidChange` with the new value. Suite-isolated `UserDefaults(suiteName:)` per
-test, per the `ScreenCalibrationProviderTests` harness.
+Pins the operator-settings store (`ScreeningSettingsProvider`): empty defaults → 20% Weber +
+audio on (`testEmptyDefaultsReturnTwentyPercentWithAudioOn`);
+`testTwentyPercentIsAnApprovedChoiceAndTheDefault` (`.twenty` = 0.20, label "20%",
+`defaultChoice`, and the picker order 5% / 10% / 15% / 20% built from `allCases`); save/read round
+trips for every 5/10/15/20% × audio combination; garbage, schema-mismatch, and disallowed-weber
+records return defaults AND delete themselves; save/reset post `.screeningSettingsDidChange` with
+the new value. Suite-isolated `UserDefaults(suiteName:)` per test, per the
+`ScreenCalibrationProviderTests` harness.
+
+**v1 → v2 upgrade (5)** — a schema-1 record is upgraded on read, not deleted:
+`testLegacyImplicitTenPercentMovesToNewDefaultAndKeepsAudio` (a v1 10% may have been written by the
+audio toggle alone, so it is treated as "never chose": contrast → 20%, audio kept, and the record is
+re-persisted as v2 so the upgrade runs exactly once) · `testLegacyExplicitChoicesSurviveTheUpgrade`
+(5% / 15% can only have come from the picker, so they are kept) ·
+`testLegacyRecordWithDisallowedWeberIsDeleted` · `testUnknownSchemaVersionsAreDeletedOnSight`
+(schema 0 and schema 3 both delete) · `testUpgradeDoesNotPostChangeNotification` (a getter must not
+fan out UI updates).
 
 ### DistanceHoldTrackerTests — 9 tests
 
@@ -206,7 +230,7 @@ fresh re-anchoring after a void.
 
 ---
 
-### CoordinatorGateTests — 38 tests
+### CoordinatorGateTests — 54 tests
 
 The largest and most important file: it drives `MyopiaScreenCoordinator` through complete flows with
 injected mocks, asserting the protocol invariants listed in the README. A static
@@ -225,9 +249,10 @@ reproducible.
 | `testHoldWithinToleranceCapturesMeanOfWindow` | The recorded `lockedDistanceCM` is the deduped hold-window mean (≠ anchor, ≠ target), frozen at completion |
 | `testHoldShowsWholeSecondCountdown` | `captureState` counts "2 s → 1 s" from sample timestamps |
 | `testLockedDistanceClearedByBackNavigationAndManualSkip` | Back + manual skip never exports an abandoned run's captured distance |
-| `testGatePassRunsBothLowContrastConditions` | Passing the 20/25 gate runs red *and* teal, then results |
-| `testGateFailSkipsLowContrast` | Failing the gate skips low contrast entirely and records `interpretation = "highContrastBelowGate"` |
+| `testGatePassRunsBothLowContrastConditions` | Reaching 20/25 runs red *and* teal, then results |
+| `testBelowGateHighContrastStillRunsBothLowContrastConditions` | A below-20/25 high-contrast run still runs red *and* teal; all three results and the delta are recorded and `interpretation` is a delta label, never `highContrastBelowGate` |
 | `testAmbiguousRepeatsSameLetterWithoutAdvancing` | An ambiguous answer re-presents the *same* letter and records no trial |
+| `testSessionRecordsConfiguredWeberContrast` | The injected config's `lowContrastWeber` (0.15, deliberately not the 0.20 default) is what the session record exports |
 
 **Distance policy — the heart of the correctness story**
 
@@ -239,7 +264,7 @@ reproducible.
 | `testResumeRequiresInsetBandNotJustDwellLock` | Re-entering the raw band is insufficient; resumption needs the **inset** band (anti-chatter hysteresis) |
 | `testInterruptionMidTrialPausesAndRecoveryResumesSameLetter` | An AR session interruption pauses and recovers to the same letter |
 | `testBackgroundPausesTrialAndForegroundRequiresRelock` | Backgrounding pauses; foregrounding alone never resumes scoring |
-| `testRecordedTrialDistanceIsAnswerTimeSampleNotLockValue` | The recorded `distanceCM` is the answer-time measurement, not the lock value — **currently failing, see below** |
+| `testRecordedTrialDistanceIsAnswerTimeSampleNotLockValue` | The recorded `distanceCM` is the answer-time measurement, not the lock value |
 | `testNoStimulusBeforeFirstDistanceSample` | No letter is shown until a real measurement exists (no assumed distance) |
 
 **Calibration and sizing**
@@ -253,6 +278,33 @@ reproducible.
 | `testScoringBlockedWhenCalibrationChangesMidTrial` | A mid-session calibration change pauses instead of mis-scoring |
 | `testTrialCarriesProvenanceAndSessionCarriesCalibration` | Each trial records its sizing provenance; the session records the calibration in force |
 
+**No-input window**
+
+| Test | Asserts |
+| --- | --- |
+| `testListenArmsTheServiceWithTheNoInputWindow` | `listen()` arms the service with `config.recognitionTimeoutSeconds` (10 s, soft). It is the only place the window flows and every fake discards it, so a regression to a literal or the old 5 s / 8 s would otherwise ship green |
+| `testNoInputTrialsAreRecordedButNeverMoveTheStaircase` | Five silent letters are five uncounted `no input registered` rows in the same slot (`trialNumber` 1): the level stays 20/40, each is replaced by a fresh letter, and three correct answers afterwards still early-pass the line with slots 1, 2, 3 (backstop raised to 100 to isolate the rule from the keypad hand-off) |
+| `testLateSilenceAfterTeardownIsDropped` | `teardown()` bumps the recognition generation, so a silence callback already dispatched cannot score into a dead session |
+
+**Low-contrast starting level** — two ladder steps coarser than the finest high-contrast line
+actually passed, clamped to the coarsest rung (20/200).
+
+`testLowContrastStartsTwoStepsCoarserThanHighContrastResult` (passed 20/20 → starts 20/32) ·
+`testLowContrastStartAtGateEdgeMatchesProtocolStart` (passed 20/25 → 20/40, identical to
+`startAcuity`) · `testLowContrastStartAfterBelowGateResultAnchorsToPassedLine` (passed only 20/50 →
+20/80) · `testLowContrastStartClampsToCoarsestRungWhenNothingPassed` (nothing passed → 20/200) ·
+`testBothLowContrastConditionsStartAtTheSameDerivedLevel` (teal is never chained
+off red) · `testLowContrastFallsBackToProtocolStartWhenGateSkipped` ·
+`testLowContrastStartIsRederivedAfterBackNavigation`.
+
+**Inter-stimulus blank** — the next letter is committed but hidden, and recognition is not armed,
+until the blank clears.
+
+`testBlankHoldsStimulusHiddenAndDefersListening` · `testBlankPrecedesEachSubsequentLetter`
+(warm-up included) · `testDistancePauseDuringBlankCancelsIt` (the square never sticks black and a
+cancelled reveal never fires late) · `testZeroBlankPresentsSynchronously` (the fast path the rest
+of the suite relies on).
+
 **Back navigation** — returns to the *start* of the preceding phase and rolls back what that phase wrote.
 
 `testBackFromWarmupReturnsToDistanceLock` · `testBackFromGateReturnsToWarmup` ·
@@ -261,10 +313,16 @@ reproducible.
 generation counter neutralizes an in-flight callback from the abandoned phase).
 
 **Forward (Next) navigation** — skips the current test *without* recording a result, preserving earlier results.
+On the three scored phases the operator's Next first shows a "Skip this test?" confirmation; that
+dialog lives in `ScreeningRootView` (keyed off `ScreenPhase.scoredCondition`) and is device-only —
+the coordinator's `goNext()` is unchanged and these tests drive it directly.
 
 `testNextFromSetupBeginsDistanceLock` · `testNextFromDistanceLockSkipsToWarmup` ·
 `testNextFromWarmupSkipsToGate` · `testNextFromGateSkipsToLowContrastWithoutRecording` ·
-`testNextThroughLowContrastConditionsReachesResults` · `testNextFromResultsIsNotHandled`.
+`testNextThroughLowContrastConditionsReachesResults` · `testNextFromResultsIsNotHandled` ·
+`testScoredConditionForPhase` (`ScreenPhase.scoredCondition` is non-nil for exactly the three
+scored phases) · `testSkippingOneLowContrastConditionKeepsTheOtherTwoResults` (Next on red leaves
+red `nil`, keeps the high-contrast and teal results, delta `nil`, `interpretation = notComputed`).
 
 ---
 
@@ -314,17 +372,28 @@ mis-size letters on different hardware.
 
 ---
 
-### LetterMappingTableTests — 14 tests
+### LetterMappingTableTests — 19 tests
 
 `testCommonPhonetics` ("see"→C, "aitch"→H, "kay"→K …) · `testCaseAndPunctuationInsensitive` ·
-`testSingleLetterDirectMatch` · `testNonSloanReturnsNil` · `testClassifySingleLetter` ·
-`testClassifyAmbiguousWhenMultipleDistinctLetters` (two distinct letters in one transcript →
-`.ambiguous`, never a guess) · `testClassifyUnrecognizedKinds` (`.silence` vs `.unintelligible`) ·
-`testMisidentificationCorrections` ("okay"→K, "and"→N, "our"→R).
+`testSingleLetterDirectMatch` · `testNonSloanReturnsNil` · `testConversationalYesIsNotALetter`
+("yes" must never score as S) · `testNormalizationSpacesOutPunctuation` ("C-D" → "c d",
+"[BLANK_AUDIO]" → "blank audio") · `testPunctuationJoinedLettersClassifyAsAmbiguous` ·
+`testClassifySingleLetter` · `testClassifyAmbiguousWhenMultipleDistinctLetters` (two distinct
+letters in one transcript → `.ambiguous`, never a guess) · `testClassifyUnrecognizedKinds`
+(`.silence` vs `.unintelligible`) · `testMisidentificationCorrections` ("okay"→K, "and"→N, "our"→R).
 
 Three **table-integrity** tests guard the data itself: `testMisidentificationValuesAreSloanLetters`,
 `testAllValuesAreSloanLetters`, and `testPhoneticsAndMisidentificationsAreDisjoint` — so a new entry
 can never introduce a non-Sloan target or shadow a genuine phonetic spelling.
+
+**Spoken skip (5)** — `testClassifySkipAndWhisperVariants` (every `skipPhrases` entry, plus
+"Skip." / "SKIP!" / "skipped" / "skype", → `.skipped`) · `testClassifySkipWithFillerOrTailIsSkip`
+("um skip", "skip it", "please skip", "skip thank you") ·
+`testClassifySkipMixedWithLetterIsAmbiguous` ("c skip", "S, skip", and "okay skip" — "okay" is a K
+correction, pinned so nobody "fixes" it blind) · `testTierTwoSkipVariantsAreNotSkips` ("ski",
+"kip", "skit", "skid", "skiff" stay `.unintelligible`; "S K" stays `.ambiguous`) ·
+`testSkipPhrasesNeverCollideWithLetterTables` (no skip phrase may resolve to a Sloan letter through
+any layer, or a real answer would be scored as a skipped miss).
 
 ---
 
@@ -394,7 +463,7 @@ so archived sessions stay comparable to live ones.
 
 ---
 
-### WhisperTranscriptFilterTests — 9 tests
+### WhisperTranscriptFilterTests — 10 tests
 
 `nonAnswerKind(_:)` runs *before* the letter mapper and separates "the child made a sound" from "the
 microphone heard nothing".
@@ -402,22 +471,138 @@ microphone heard nothing".
 `testFillerKind` ("um", "uh", "hmm" → `.filler`) · `testSilenceKindForHallucinations`
 (Whisper's classic near-silence output "you", "thank you", "thanks for watching" → `.silence`) ·
 `testSilenceKindForSilenceMarkers` ("blank audio", "silence", "music") ·
-`testSilenceKindForEmptyAndWhitespace` · `testRealAnswerCandidatesReturnNil` (a genuine answer must
-reach the mapper untouched) · `testDeprecatedIsNonAnswerShimAgrees`.
+`testSilenceKindForBracketedWhisperMarkers` ("[BLANK_AUDIO]", "(blank audio)", "[SILENT_AUDIO]",
+and the compact "blankaudio" / "silentaudio") · `testSilenceKindForEmptyAndWhitespace` ·
+`testRealAnswerCandidatesReturnNil` (a genuine answer must reach the mapper untouched) ·
+`testHesitationPrefixedAnswersReachTheMapper` ("Er, R", "Uh, H" must not be swallowed as filler —
+their compact forms "err" / "uhh" are filler words) · `testDeprecatedIsNonAnswerShimAgrees`.
 
 The critical one is `testRejectedPhrasesNeverCollideWithLetterTables`: **no rejected phrase may also
 be a valid letter spelling.** Without it, adding a filler word could silently make a real Sloan
-answer unanswerable.
+answer unanswerable. `testSkipPhrasesReachTheMapper` is its mirror for the spoken skip: the filter
+runs first, so no `skipPhrases` entry may sit in either rejection set, and "um skip" / "skip thank
+you" / "skip you" must pass through and classify as `.skipped`.
 
 ---
 
-### ContrastPaletteTests — 8 tests
+### ListeningBufferRulesTests — 16 tests
 
-New with the configurable-contrast work: `testWeberFifteenPercent` (0.85 at 15% — a
-protocol-selectable value) and `testContrastConfigDefaultIsTenPercent` (pins BOTH
-`ContrastConfig().weber` and `ScreenConfig().lowContrastWeber` to the 10% protocol default so
-they can never silently drift apart). The red/teal channel tests now pin behavior against an
-explicit `ContrastConfig(weber: 0.10)` (stimulus channel = 0.90 of background).
+The pure listening-buffer rules behind `WhisperKitLetterRecognitionService` (`ListeningBufferRules`,
+a port of the sibling ETDRS app's rule tests plus Myotect's additions): WHEN audio is transcribed,
+what the voice trace says, and how the deadline and the consumed pointer move. Each test names the
+device failure it prevents.
+
+**Voice trace** — `testBlockEnergiesAreRMSPerFullBlock` (100 ms blocks, trailing partial block
+dropped, boundaries follow the slice) · `testRelativeEnergiesIgnoreDigitalZeroReferencesAndStartQuiet`
+(a zero or ramp-in buffer at engine start never becomes the silence reference — otherwise room noise
+reads as voice for a whole window — and the first block reads 0) ·
+`testWindowHadVoiceNeedsTwoConsecutiveVoiceBlocks` (a speech-length sound is two consecutive voice
+blocks; a click is not) · `testTailHasVoiceLooksOnlyAtTheQuietTail` ·
+`testSpeechRunsIgnoreIsolatedVoiceBlocks`.
+
+**Passes and the consumed pointer** — `testLivePassWaitsForTheUtteranceToEnd` (voice in the
+unconsumed span AND a quiet 0.3 s tail, or 2 s of continuous voice; never on the first syllable
+Whisper would complete into "seat") ·
+`testConsumedPointerAdvancesForAnswersAndFinalButRetainsATailAfterANonAnswerPass` (an answer or the
+final flush consumes everything; any other pass keeps the newest tail so a straddling onset survives
+and a hallucinated "Thank you." can never swallow the child's audio; never backwards) ·
+`testLiveWindowIsTheLastRollingWindowPastTheConsumedPointer` ·
+`testFinalWindowStartsAtTheConsumedPointer` (both moved here from `RecognitionFlushRulesTests`) ·
+`testFlushSpanCoversOnlySpeechLengthRunsWithPaddingAndIsNilWithoutOne` (the deadline flush decodes
+from 0.5 s before the first speech-length run to 0.5 s after the last, clamped; an isolated click
+before the answer does not widen it; nil with no run — then Whisper is not called at all).
+
+**Myotect additions** — `testCarriedOverVoiceIsSkippedOnlyWhenTheSessionStartsInsideARun` (voice
+already sounding in session block 0 began before the child could see the letter and is skipped; a
+quiet block 0 skips nothing; a run longer than the utterance cap is capped, so a noisy room cannot
+starve the trial) · `testCarriedOverBlocksGrowMonotonicallyAsTheRunGrows` (stateless, recomputed on
+every pass) · `testDeadlineDefersOnlyForVoiceOrInferenceWithinTheCap` (the soft deadline steps back
+while the tail is voice or a decode is in flight, and never past the cap — a television keeps the
+tail voiced forever).
+
+---
+
+**Engine starts and the review-driven rules (2026-09-03)** —
+`testEngineStartBlocksAreMaskedOutOfTheReference` (the block an engine start lands in, and the
+next, are zeroed out of the trace: a mostly-digital-zero block with a sliver of room noise would
+otherwise become the silence reference, make room noise read as voice, and let the carried-over
+rule swallow a real answer) · `testCapPathRetainedTailReTriggersOnceTheSoundEnds` (after a
+2 s cap pass the retained tail IS voice, so the first quiet blocks re-run a pass over the end of
+the same long answer; a fully consumed utterance never re-triggers) · `testFlushSpanBridgesTwoRuns`
+(two speech-length runs decode as one padded span, and a run already consumed is left out).
+
+### CaptureSampleStoreTests — 4 tests
+
+The recognizer's own 16 kHz sample store (`CaptureSampleStore`): absolute, block-aligned indices
+that survive trimming, so every index the listening rules bookkeep stays valid across purges and
+engine rebuilds.
+
+`testAppendReportsCompletedBlocksOnlyAndCarriesTheRemainder` (`append` returns true only when a
+100 ms block completed — the cue to run a pass — and a partial block carries over) ·
+`testAbsoluteIndicesSurviveAPurge` (`baseIndex` advances, `totalCount` and `copySamples` keep
+answering in absolute terms) · `testPurgeIsBlockAlignedAndNeverDropsBelowKeep` (pins
+`baseIndex % 1600 == 0` after every purge, so energy block `k` is always samples
+`[baseIndex + 1600k, …)`) · `testCopySamplesClampsOutOfRangeRequests` (a range reaching before the
+purge point or past the end is clamped, never a crash).
+
+---
+
+### RecognitionFlushRulesTests — 7 tests
+
+The pure outcome rules of `WhisperKitLetterRecognitionService`'s deadline flush, testable without
+WhisperKit. They exist because a `no input registered` row is visible in every export and its
+backstop is the only exit from a same-level loop, so the service may only say "silence" when nothing
+usable was said in the whole window. The buffer arithmetic lives in `ListeningBufferRulesTests`.
+
+`resolveFinalOutcome`: `testSilentTailAfterEngagedPassReportsTheEngagedPass` ("um" / "banana" /
+"C D" at 2 s and quiet after → the earlier filler / unintelligible / ambiguous pass is reported, so
+the child retries with a re-prompt instead of being logged absent) ·
+`testSilentTailWithNoEngagementIsSilence` · `testAnsweredOrInspectedTailAlwaysWins` (a letter,
+skip, unintelligible tail, or service failure is never overridden by earlier engagement).
+`strongerEngagement`: `testEngagementRanksAmbiguousOverUnintelligibleOverFiller` (never downgrades)
+· `testNonEngagementNeverCountsAsEngagement` (silence, letters, skips, and failures rank zero).
+`upgradedForTrace`: `testSilenceWithSpeechLengthSoundUpgradesToUnintelligible` (a transcript the
+filter called a silence hallucination — "Thank you.", "you", "" — over a speech-length sound becomes
+`.unintelligible`, which retries; every other outcome passes through untouched; with no sound the
+hallucination stays silence) · `testHallucinationCountsAsEngagementOnlyWithSound` (the upgrade feeds
+the engagement bookkeeping, so a quiet tail after a hallucination-over-sound retries, while a
+hallucination over nothing lets the window still end as silence).
+
+---
+
+### HeardDiagnosticFormatterTests — 4 tests
+
+One test per `RecognitionDiagnostic.Kind`; the strings are what the operator reads at the top of
+the trial screen (PROTOCOL §7c), so a wording change is a deliberate edit here, never a side effect.
+`testListeningIsTheArmedPlaceholder` (`Listening…`) · `testHeardShowsTheRawTranscriptAndEveryOutcome`
+(`Heard "C." → C ✓` / `✗`, `→ skip`, `→ more than one letter`, `→ hesitation`, `→ no letter`,
+`→ nothing usable`, `Microphone unavailable`; whitespace and newlines collapse; a long hallucination
+is capped at 24 characters with an ellipsis) · `testDeferredDeadlineShowsTheAccumulatedExtension`
+(`Deadline extended +0.75 s`) · `testFlushedSilentSaysNothingWasHeard` (`Heard nothing (window
+elapsed)`).
+
+---
+
+### WhisperServiceSourcePinsTests — 1 test
+
+`testServiceNeverReadsWhisperKitsBufferOrItsVoiceHeuristic` reads
+`WhisperKitLetterRecognitionService.swift` as text (the one file the simulator cannot exercise) and
+asserts it never references `AudioProcessor.isVoiceDetected`, `.relativeEnergy`,
+`purgeAudioSamples`, or `audioProcessor.audioSamples` — the three regressions that reintroduce the
+on-device bugs the listening rework fixed (data race, indices reset by every engine start, gating on
+the first syllable) — while still reaching the engine's own `isRunning` through the
+`as? AudioProcessor)?.audioEngine` cast and feeding `CaptureSampleStore`.
+
+---
+
+### ContrastPaletteTests — 9 tests
+
+`testContrastConfigDefaultIsTwentyPercent` pins `ContrastConfig().weber`,
+`ScreenConfig().lowContrastWeber`, AND `WeberContrastChoice.defaultChoice` to the 20% protocol
+default so they can never silently drift apart. `testWeberTwentyPercent` (0.80 at 20%) and
+`testWeberFifteenPercent` (0.85 at 15%) cover the protocol-selectable values. The red/teal channel
+tests pin behavior against an explicit `ContrastConfig(weber: 0.10)` (stimulus channel = 0.90 of
+background), not the type default.
 
 `testWeberFivePercent` and `testWeberTenPercent` pin `stimulus = background × (1 − weber)` ·
 `testWeberMatchesMeetingExample` pins the agreed clinical worked example ·
@@ -427,11 +612,23 @@ light contaminates the short-wavelength stimulus, so red must be exactly 0 in th
 
 ---
 
-### SessionStoreTests — 9 tests
+### SessionStoreTests — 12 tests
 
 New with the configurable-contrast work: `testCSVCarriesSessionWeberContrastOnEveryRow` (the
-19th `weber_contrast` column repeats the session value on every trial row) and
-`testDeleteAllSessionsRemovesEverything` (Clear All History wipes the store).
+19th `weber_contrast` column repeats the session value on every trial row — pinned positionally,
+since it is no longer the last column — and the header still ends in `,counts_toward_staircase`,
+pinning the append-last rule) and `testDeleteAllSessionsRemovesEverything` (Clear All History wipes
+the store). `testNonLetterResponseSentinelsStayUnquotedAndAlignedInCSVAndJSON` pins the `-` /
+`skip` / `no input registered` sentinels: written verbatim, 20 plain columns even for a
+comma-splitting parser, never quoted, and round-tripped through JSON.
+
+New with the uncounted no-input rule (2026-09-03):
+`testCountsTowardStaircaseRoundTripsThroughJSONAndCSVWithLegacyNilReadingAsOne` (the 20th
+`counts_toward_staircase` column is `1` / `0`, appended last; `true` / `false` / nil round-trip
+through JSON and export as `1` / `0` / `1`) ·
+`testLegacyTrialJSONWithoutTheFlagDecodesAsNilAndExportsAsCounted` (a pre-2026-09-03 row — including
+a 09-02-era `no input registered` miss — decodes with the flag absent, re-encodes without the key,
+and exports as counted).
 
 `testJSONRoundTrip` · `testDecodeJSONRoundTrip` (ISO-8601 dates, sorted keys) ·
 `testCSVRowCountMatchesTrials` (header + one row per trial) · `testDeltaIsGreenMinusRed` (sign
@@ -457,23 +654,38 @@ as a trustworthy sample, and recovery restarts smoothing with no residue) ·
 
 ---
 
-### CoordinatorRetryTests — 9 tests
+### CoordinatorRetryTests — 22 tests
 
-End-to-end escalation through the coordinator, using a mock speech service that returns non-answers.
+End-to-end escalation through the coordinator, using a scripted speech service. Retries are driven
+by `.unrecognized(.filler)` — voice silence on a scored trial neither retries nor counts: it is
+recorded and replaced by a fresh letter (see below).
 
 | Test | Asserts |
 | --- | --- |
 | `testRepeatedNonAnswersEscalateToKeypadAfterCap` | After the retry cap the trial hands off to the clinician keypad instead of looping forever |
 | `testKeypadSubmissionScoresTrialAndNextTrialReturnsToVoice` | A keypad answer scores normally and the next trial goes back to voice |
-| `testKeypadNoResponseScoresIncorrectTrial` | "Couldn't answer" records an incorrect trial rather than silently skipping |
+| `testKeypadNoResponseScoresIncorrectTrial` | Keypad "No response" records an incorrect trial (`-`) rather than being dropped from the record |
 | `testServiceFailureEscalatesImmediatelyWithAlert` | `.serviceFailure` bypasses retries entirely — it is structural |
 | `testDistancePauseRepeatDoesNotGrantExtraRetries` | A pause repeat is not an answer attempt, so it cannot farm extra retries |
 | `testConsecutiveKeypadTrialsBecomeStickyAndClinicianRestores` | Repeated escalations make manual mode sticky until explicitly restored |
 | `testKeypadOnlyStartStaysStickyAcrossResolvedLetters` | Starting keypad-only from setup stays manual even as letters resolve successfully — it must not silently drift back to a mic that was never available |
 | `testGoBackClearsNonStickyEscalationForCleanRerun` | Back re-runs a phase with escalation state reset, so a prior bad streak does not poison the retry |
 | `testWarmupEscalationScoresNothingAndKeypadAdvancesWarmup` | Escalation during warm-up records no trial but still advances |
+| `testSpokenSkipScoresIncorrectTrialAndPresentsNextLetter` | A spoken skip records an incorrect trial with `response = "skip"` and the NEXT letter listens by voice — no retry, no keypad |
+| `testVoiceSilenceRecordsAnUncountedNoInputRowAndPresentsAFreshLetterAtTheSameLevel` | Voice silence records an incorrect `no input registered` row with `countsTowardStaircase = false` in slot 1; the level is unchanged and a different letter is listening |
+| `testUncountedNoInputKeepsTheLevelPresentsAFreshLetterAndResetsTheRetryBudget` | The replacement is a genuinely fresh trial: same level, different letter, flag false on the row, and a fresh retry budget — a filler spent on the silent letter does not carry over (two fillers on the replacement still retry; the third escalates; nothing extra is recorded) |
+| `testUnintelligibleAndAmbiguousStillRetryThenEscalateWithoutScoring` | Unintelligible / ambiguous answers still retry to the cap and escalate with nothing scored |
+| `testThreeConsecutiveNoInputTrialsHandTheNextLetterToKeypad` | Three silent letters are recorded, uncounted, all at 20/40 in slot 1; the fourth presentation — a FRESH letter, not the silent one — goes to the keypad; keypad "No response" records a counted `-` in that same slot (`trialNumber`s 1, 1, 1, 1), and the trial after returns to voice |
+| `testLetterBetweenSilencesResetsTheNoInputCount` | A spoken letter between silences resets the consecutive count — 2 + 1 + 2 never escalates (four uncounted rows) |
+| `testConsecutiveNoInputEscalationsBecomeSticky` | A no-input row does not clear the escalation streak, so two no-input escalations with no voice letter between them make manual mode sticky |
+| `testWarmupSkipCountsAsCompletedPracticeLetter` | A skip during warm-up counts as a completed practice letter and records nothing |
+| `testSpokenSkipResetsTheNoInputCount` | S, S, skip, S, S never escalates: a heard skip resets the consecutive no-input count (five rows, one counted) |
+| `testSpokenSkipClearsTheEscalationStreak` | A spoken skip is a heard voice answer, so it restarts the sticky-manual streak (keypad → skip → keypad stays non-sticky) |
+| `testSilencesNeverCompleteTheSessionButTheBackstopKeypadCan` | Four wrong letters plus three silences at teal 20/20 do not end the session (silence never ends a condition); the backstop hands the fresh letter to the keypad, and the keypad "No response" is the fifth counted miss that completes it with no keypad armed on results (35 rows, 32 counted) |
+| `testGateEndsOnLettersAndSilencesOnTheFirstLowContrastLettersTripTheBackstopInPlace` | The gate is ended by a wrong letter — two interleaved silences neither count nor carry across the boundary — and three silences on the first red letters trip the backstop with red still at 20/40 (19 rows, 14 counted) |
+| `testReturningToVoiceAfterTheBackstopKeypadReopensTheCaptureSession` | A keypad escalation closes the block's capture session; when the keypad trial resolves and the next letter returns to voice, `listen()` re-opens it (idempotent), so the rest of the block keeps its warm engine and interruption/route observers instead of cold-starting the engine after every reveal |
 
-### RetryEscalationPolicyTests — 8 tests
+### RetryEscalationPolicyTests — 9 tests
 
 The same state machine in isolation: `testRetrySequenceThenEscalation` (first retry carries a spoken
 re-prompt, later ones do not) · `testBeginTrialResetsAttemptCount` ·
@@ -481,12 +693,28 @@ re-prompt, later ones do not) · `testBeginTrialResetsAttemptCount` ·
 `testStickyManualAfterConsecutiveEscalationsAndVoiceResolveClearsStreak` ·
 `testStickyManualBypassesRetries` · `testClinicianRestoreClearsStickyAndStreak` ·
 `testForceStickyManualSurvivesResolvedTrials` (the keypad-only start latches until the clinician
-restores voice, rather than clearing on the first successful answer).
+restores voice, rather than clearing on the first successful answer) ·
+`testNoInputEscalationCountsTowardStickyAndOnlyAHeardVoiceAnswerClearsIt` (the no-input backstop's
+hand-off counts toward sticky manual; `trialResolved(byVoice: false)` — a keypad entry or a
+no-input row — leaves the streak alone).
 
-### CoordinatorTTSTests — 6 tests
+### CoordinatorTTSTests — 10 tests
 
-`testPhasePromptsAreSpoken` · `testFirstRetrySpeaksReprompt` ·
-`testDistanceGuidanceIsSpokenAndThrottled` · `testCompletionSpeaksAllDone`.
+`testPhasePromptsAreSpoken` · `testFirstRetrySpeaksReprompt` (a filler answer earns one spoken
+re-prompt; the second retry is silent) · `testNoInputRowDoesNotSpeakReprompt` (voice silence on a
+scored trial is recorded, not retried — no re-prompt, one uncounted row, a fresh letter listening
+at the same level) · `testRepromptRetryBlanksLetterUntilPromptEnds` (the square is blanked while "Say the
+letter you see out loud." plays, and the same letter re-presents with recognition armed only in the
+prompt's completion; the stimulus stays committed so the blue frame stays up) ·
+`testWarmupRepromptRetryBlanksUntilPromptEnds` (the same blank-during-re-prompt rule in warm-up,
+where the completion presents a FRESH letter) ·
+`testTeardownDuringRepromptClearsBlankAndIgnoresLateCompletion` (teardown mid-prompt clears the
+blank, and the prompt's late completion finds a dead context) ·
+`testVoidHoldPromptIsNotSupersededByGuidanceSpeech` (guidance speech stays
+quiet while a voided hold's "try again" notice is up, or the prompt would be cut off mid-word) ·
+`testDistanceGuidanceIsSpokenAndThrottled` · `testCompletionSpeaksAllDone` (answers wrong through
+all three conditions before asserting `.results` and the "All done" prompt — no path ends the
+session early).
 
 The load-bearing one is `testListenDeferredWhileSpeakingAndResumesAfterFinish`: **recognition must
 not run while the app is speaking**, or the microphone captures the app's own prompt. Listening is
@@ -507,6 +735,43 @@ completion, which would hang or double-advance the trial) · `testSilentAnnounce
 `testSamePromptWithinIntervalIsSuppressed` (no chanting) · `testResetClearsHistory` ·
 `testSuppressedAttemptDoesNotExtendWindow` (a suppressed attempt must not push the next allowed
 utterance further out).
+
+### ScreenConfigTests — 17 tests
+
+The pure derivations on `ScreenConfig`.
+
+**`acuityLevel(coarserBy:than:)` (6)** — `testTwoStepsCoarserWalksTheLadderTowardLargerLetters`
+(20/16 → 20/25, 20/20 → 20/32, 20/25 → 20/40) · `testBelowGateAnchorsStillWalkTheLadderAndClamp`
+(coarser by 2: 20/50 → 20/80, 20/80 → 20/125, 20/200 → 20/200) · `testZeroStepsIsIdentity` ·
+`testClampsAtTheCoarsestLevel` · `testUnknownLevelFallsBackToProtocolStart` (an off-ladder input is
+never returned verbatim — the engine would silently drop it to 20/200) · `testHonorsACustomLadder`.
+
+**`staircaseConfig` (2)** — `testStaircaseConfigDefaultsToTheProtocolStartAndGatesOnlyWhenAsked` ·
+`testStaircaseConfigCarriesAStartOverride`.
+
+**Protocol and listening defaults (8)** — `testDefaultLowContrastOffsetIsTwoSteps` ·
+`testDefaultInterstimulusBlankIsQuarterSecond` · `testDefaultNoInputWindowIsTenSeconds`
+(`recognitionTimeoutSeconds` = 10, soft — a regression to the old 5 s / 8 s fails here, not on
+device) · `testDefaultSoftDeadlineStepAndCap` (`deadlineDeferralStepSeconds` 0.25,
+`deadlineDeferralCapSeconds` 3) · `testUtteranceRulesDefaults` (`utteranceEndQuietSeconds` 0.3,
+`maximumUtteranceSeconds` 2, `voiceSilenceThreshold` 0.10 — the quiet tail is also the tail a
+non-answer pass retains, so both derive from ONE key) · `testPurgeKeepCoversTheSilenceReference`
+(`capturePurgeKeepSeconds` ≥ the 2 s reference window the voice trace is computed against, or the
+first blocks of every session would read as voice) ·
+`testDefaultListenResumeAfterSpeechIsHalfSecond` (`listenResumeAfterSpeechSeconds` = 0.5) ·
+`testDefaultNoInputBackstopIsThreeTrials` (`noInputTrialsBeforeEscalation` = 3).
+
+**`init(settings:)` (1)** — `testInitFromSettingsCopiesContrastAndAudio`: the settings → config
+seam copies the Weber choice and the audio switch (probed with the never-default 5% / audio-off)
+and leaves every other tunable at the protocol default; default settings yield 0.20 and TTS on.
+
+### IdleTimerControllerTests — 5 tests
+
+`testDisableSleepDisablesTheIdleTimer` · `testRestorePutsBackTheValueCapturedByTheFirstDisable` ·
+`testRepeatedDisableSleepKeepsTheOriginalValue` (re-asserted on every return to the foreground, so
+repeated calls must not overwrite the remembered original with the value the controller itself
+wrote) · `testRestoreIsSafeBeforeAnyDisableAndIsIdempotent` ·
+`testRestoreKeepsAnAlreadyDisabledTimerDisabled`.
 
 ### MyotectTests — 1 test
 
@@ -563,34 +828,73 @@ appears alongside the disabled *Begin*. It starts the session in sticky manual m
 
 ### 3.4 Warm-up and trials
 
-1. Five large (20/80) high-contrast letters, unscored. Say each aloud.
-2. Confirm a correctly recognized letter advances, and that an unclear answer **re-presents the same
-   letter** rather than moving on.
-3. During a scored trial, **step out of the band**. Expected: the letter disappears / pauses
+1. Before the first letter, brief the child: **"If you cannot see the letter, say 'skip'."** No
+   spoken prompt says this.
+2. Five large (20/80) high-contrast letters, unscored. Say each aloud.
+3. Confirm a correctly recognized letter advances, and that an unclear answer **re-presents** (a
+   fresh letter in warm-up, the **same letter** in a scored trial) rather than moving on. A
+   no-input window ends with a **fresh** letter at the **same** level and a `no input registered`
+   row that does not count.
+4. Say **"skip"** to one warm-up letter. Expected: it counts as a completed practice letter and the
+   next letter follows within ~1 s. In a scored trial a skip records an incorrect `skip` row.
+5. During a scored trial, **step out of the band**. Expected: the letter disappears / pauses
    immediately and the microphone stops listening.
-4. Step back to just inside the band edge (e.g. 181 cm). Expected: it does **not** resume — the
+6. Step back to just inside the band edge (e.g. 181 cm). Expected: it does **not** resume — the
    inset band requires ~183 cm plus a fresh dwell lock. This is the anti-chatter behavior.
-5. Return to ~200 cm and hold. Expected: the **same letter** re-presents.
-6. Background the app mid-trial, then foreground it. Expected: paused on return; brightness
+7. Return to ~200 cm and hold. Expected: the **same letter** re-presents.
+8. Background the app mid-trial, then foreground it. Expected: paused on return; brightness
    re-locks; resumption still requires a re-lock.
+9. Answer wrong through high contrast. Expected: red and teal must **still run**; the results screen
+   shows all three conditions and a delta. Nothing is ever skipped automatically.
 
-### 3.5 Spoken prompts and retry escalation
+### 3.5 Spoken prompts, listening, and retry escalation
 
 The audio path is the one area where simulator coverage is weakest — `SilentAnnouncer` proves the
-*wiring*, but only a device proves the *audio session*.
+*wiring*, `ListeningBufferRulesTests` prove the *rules*, but only a device proves the *audio
+session* and the real voice trace at 2 m. Nothing in this section runs in the simulator.
+
+**Prompts and escalation** (unchanged by the 2026-09-03 listening rework):
 
 | Check | Expected |
 | --- | --- |
 | Entering each phase | The matching prompt is spoken ("Let's practice…", "Here we go…", "All done. Great job!") |
 | While a prompt is playing | Recognition does **not** start — verify the app never transcribes its own voice |
 | Drift out of band repeatedly | "Move closer" / "Move farther away" speak on change but do **not** repeat more than once per 5 s |
-| Stay silent for a trial | First retry speaks a re-prompt; the second retry is silent |
-| Stay silent past the retry cap | The trial escalates to the clinician keypad |
-| Escalate two trials in a row | Manual mode becomes sticky until voice is explicitly restored |
+| Say "um" and then nothing | The first retry speaks "Say the letter you see out loud." with the square blanked; the same letter re-presents when the prompt ends; the second retry is silent |
+| Say "skip" | Scored as an incorrect `skip` row; the next letter follows within ~1 s |
+| Stay silent during warm-up | Unscored: the first retry re-prompts, the second is silent, then the keypad — the dead-microphone guard |
+| Escalate two trials in a row (retry cap, or two no-input backstops) | Manual mode becomes sticky until voice is explicitly restored |
 | Deny microphone permission mid-session | `.serviceFailure` escalates **immediately**, with no retry loop |
 
-Cover the mic and let a trial run out: the app must escalate to the keypad rather than re-presenting
-the same letter forever. That is the specific failure mode `RetryEscalationPolicy` exists to prevent.
+**Listening rework (2026-09-03) — iPhone at 2 m, Xcode console filtered on `[Whisper]`.** Each row
+names the log line that proves it; the "Heard" line at the top of the trial screen (PROTOCOL §7c)
+shows the same thing without the console.
+
+| # | Do / say | Expected | Log that proves it |
+| ---: | --- | --- | --- |
+| 1 | Answer within 0.2 s of the reveal, 10 letters | Every letter scored on the first utterance — never "seat" / "okay" from a truncated first syllable | `mic armed +0.0x s after reveal`, then `live pass on … s (voiced blocks: n): "C." → letter("C")` |
+| 2 | Drag the previous answer across the next reveal, then answer the new letter | The first utterance is ignored, the second scored — no bleed between letters | `carried-over voice: skipped N blocks`, then exactly one live pass |
+| 3 | Stay silent until ~9.8 s, then answer | Scored for **this** letter — the window must not cut you off while sound is being collected | `deadline deferred +0.25 s (total …)` × n, `live pass … → letter`, `trial #n ended: … after … s` |
+| 4 | Whisper faintly | Re-prompt and the **same** letter — never a `no input registered` row for a child who spoke (the trace, not Whisper's text, decides silence) | `live pass … "Thank you." → unrecognized(…unintelligible)` (or the same from `final flush …`), never `final flush skipped` |
+| 5 | Quick soft letters ("O", "D") at 2 m | Scored live; note the voiced block count of each answer and tune `voiceSilenceThreshold` if answers show fewer than 2 blocks | `live pass on … s (voiced blocks: n)` |
+| 6 | Stay silent for one scored letter | ~10 s later a **fresh letter at the same level** — no re-prompt, no retry; Heard line `Heard nothing (window elapsed)`; the export shows a `no input registered` row with `counts_toward_staircase = 0` | `final flush skipped — no speech-length sound in the window`, `flush resolved: tail unrecognized(…silence) … → unrecognized(…silence)` |
+| 7 | Stay silent for three scored letters in a row | The level shown never changes across the three; the **fourth** letter appears on the clinician keypad — this backstop is the only exit from the loop (~30–40 s of silence in total) | Three `trial #n ended: unrecognized(…silence) after … s` lines, then the keypad |
+| 8 | TV on, say nothing | The window ends by the cap (≤ ~15 s) as unintelligible → retries → keypad, never hangs open | `deadline deferral cap reached (3.00 s)` |
+| 9 | Block start prompt ("Here we go…") | The first letter never transcribes the prompt (with the 0.5 s `listenResumeAfterSpeechSeconds`); if prompt words ever appear inside a session, raise it to 0.75 | No live-pass text resembling the prompt |
+| 10 | Say "C" and step out of band; re-lock | No outcome for the paused letter; the re-presented letter is answered normally | `stale pass for session #n dropped`, then a new `session #n start idx=…` |
+| 11 | Connect AirPods mid-window; trigger an alarm interruption | Re-armed on the same letter; store indices continue; exactly one engine rebuild | `engine configuration changed; it will be restarted` / `engine stalled … — restarting in place`, one `captureStarted` |
+| 12 | Keypad → Restore voice | The letter re-arms with the engine coming up | `mic armed +0.x s after reveal` |
+| 13 | A 10-minute block including a 3-minute distance pause, with Xcode's memory gauge open | Memory flat (both buffers are bounded during the pause too); no crash | `capture buffer trimmed after 120 s of audio` roughly every 2 min of audio, incl. during the pause |
+| 14 | Face-tracking distance while listening | No freeze — audio-session coexistence (§ 3.7) | — |
+| 15 | The Heard line | `Listening…` → `Heard "…" → X ✓` / `✗` → `Heard nothing (window elapsed)`; unreadable from 2 m; never over the optotype or the Back/Next capsules; kept across the letter transition; absent in keypad mode; hidden during a distance pause (the child may approach the phone); the previous letter's result stays visible dimmed with a `Last:` prefix until the current letter produces its own | — |
+
+Cover the mic and let the trials run out: in warm-up the app must escalate to the keypad rather than
+re-presenting letters forever — the specific failure mode `RetryEscalationPolicy` exists to prevent
+— and in a scored block three `no input registered` rows must hand the fourth letter to the keypad
+with the acuity level unchanged, rather than re-presenting fresh letters at that level forever
+(silence can no longer fail a line, so this backstop is the only termination guard). A microphone
+that never arms at all (model still loading, permission prompt, no audio delivered) must surface as
+a `.serviceFailure` alert plus keypad, never as a run of no-input rows.
 
 ### 3.6 Speech accuracy
 
@@ -600,12 +904,22 @@ conditions and log misrecognitions. Tune by adding phonetic spellings to
 Re-run `LetterMappingTableTests` afterwards; the disjointness and Sloan-membership tests will catch
 a bad entry.
 
+Say "skip" the same way and log what Whisper transcribed. Mis-hearings go in
+`LetterMappingTable.skipPhrases` (tier 1: skip, skipp, skiip, skipped, skips, skipping, skippy,
+skype, scip, skep, skup). The tier-2 candidates ski, kip, skit, skid, skiff are deliberately
+excluded until device logs show they are real skips rather than fused "S… K" self-corrections — a
+false skip is a scored miss, a missed skip only a retry. `testSkipPhrasesNeverCollideWithLetterTables`
+and `testSkipPhrasesReachTheMapper` guard a new entry.
+
 ### 3.7 Two items known to need device confirmation
 
-1. **Audio-session coexistence.** WhisperKit's `startRecordingLive` may reset the `AVAudioSession`
-   category away from the `.record`/`.measurement` configuration the app sets. **Symptom: the
-   face-tracking distance freezes while the app is listening.** If that happens, re-assert the
-   category *after* `startRecordingLive`.
+1. **Audio-session coexistence.** WhisperKit's `startRecordingLive` applies `.playAndRecord +
+   .defaultToSpeaker`; since 2026-09-03 the engine is started once per listening block and kept
+   warm across letters (rebuilt in place after a stall, a route change, an interruption, or every
+   ~2 min of audio), and the announcer speaks under that session with no category flip. **Symptom:
+   the face-tracking distance freezes while the app is listening.** If that happens, re-assert the
+   category *after* the engine start (`startEngine` in the service) — ARKit itself never touches
+   the audio session. Re-verify after the rework (§ 3.5, check 14).
 2. **ARKit stability at 2 m.** The 2 m target is within ARKit's face-tracking envelope but noisier
    than short-range use. If readings are jittery, tune `smoothingWindowSamples`,
    `maxDistanceSDCM`, `validDistanceRangeCM`, or fall back to `ManualClinicianService`.
@@ -613,10 +927,16 @@ a bad entry.
 ### 3.8 Results and export
 
 1. Complete a session; confirm the results screen shows both low-contrast results and the delta.
-2. Connect the device and open Finder → *Files* → **Myotect**, or use the Files app.
-3. Confirm `MyopiaSessions/<sessionID>.json` and `.csv` exist and that the CSV row count equals the
-   number of scored trials. Ambiguous/repeated attempts must **not** appear as rows.
-4. Confirm screen brightness returns to its pre-test value on completion, abort, and backgrounding.
+2. Tap Next during a scored condition. Expected: the **"Skip this test?"** dialog appears; *Cancel*
+   keeps the same letter up; *Skip* advances and the results detail shows **Skipped** for that
+   condition. Next on a warm-up letter still advances immediately, with no dialog.
+3. Connect the device and open Finder → *Files* → **Myotect**, or use the Files app.
+4. Confirm `MyopiaSessions/<sessionID>.json` and `.csv` exist, that the CSV row count equals the
+   number of recorded trials, and that `counts_toward_staircase` (column 20) is `0` on exactly the
+   `no input registered` rows. Ambiguous/filler/unintelligible and repeated attempts must **not**
+   appear as rows; spoken skips (`skip`, counted) and voice no-inputs (`no input registered`,
+   uncounted) **must**, as incorrect rows (unquoted — the values carry spaces but no commas).
+5. Confirm screen brightness returns to its pre-test value on completion, abort, and backgrounding.
 
 ---
 
@@ -661,15 +981,21 @@ significantly smaller display the setup screen must block with "This display is 
 
 **Where logic belongs.** Keep decisions in the pure types (`AcuityStaircaseEngine`,
 `DistanceStabilityEvaluator`, `DistanceBandGate`, `OptotypeSizing`, `LetterMappingTable`,
-`ContrastPalette`) and wire them in the coordinator. Anything testable only through a SwiftUI view
-is in the wrong place.
+`ContrastPalette`, `RetryEscalationPolicy`, and on the speech side `ListeningBufferRules` — when a
+pass runs, the consumed pointer, the flush span, carried-over voice, the soft deadline —
+`CaptureSampleStore`, `RecognitionFlushRules` (the flush's outcome rules) and
+`HeardDiagnosticFormatter`) and wire them in the coordinator or the service. Anything testable
+only through a SwiftUI view, or only with a live microphone, is in the wrong place: the WhisperKit
+service itself should be a thin caller of those rules, and `WhisperServiceSourcePinsTests` pins
+the three WhisperKit accesses it must never regain.
 
 **Determinism levers** — the coordinator takes every source of nondeterminism as an injectable:
 
 | Parameter | Use |
 | --- | --- |
+| `config:` | A `ScreenConfig`: `recognitionTimeoutSeconds` (assert it on the fake service's recorded timeout — the coordinator is the only place the window flows; the service owns the soft clock), `noInputTrialsBeforeEscalation` (raise it to isolate the uncounted no-input rule from the keypad backstop), `interstimulusBlankSeconds` (zero for the synchronous fast path), `lowContrastWeber`; the listening keys (`utteranceEndQuietSeconds`, `maximumUtteranceSeconds`, `voiceSilenceThreshold`, the deferral step/cap, `capturePurgeKeepSeconds`) reach only the WhisperKit service, so pin them in `ScreenConfigTests` and exercise them through `ListeningBufferRules` directly |
 | `distance:` | `MockDistanceProvider` — steady distance or a script of `.distance/.faceLost/.interruption/.failure` |
-| `speech:` | `MockLetterRecognitionService` — a fixed outcome sequence, or answer-correctly mode |
+| `speech:` | The coordinator suites use a private `ScriptedSpeechService` (fires only when the test calls `answer`, records the timeout it was armed with); `MockLetterRecognitionService` — a fixed outcome sequence, or answer-correctly mode — is the simulator's |
 | `fallback:` | `ManualClinicianService` — drive keypad escalation without a UI |
 | `announcer:` | `PatientAudioPrompting`; defaults to `SilentAnnouncer`, which records prompts synchronously so TTS is assertable without audio |
 | `calibration:` | `StaticScreenCalibrationProvider` — validated or deliberately uncalibrated |
@@ -682,7 +1008,9 @@ is in the wrong place.
 - Mark coordinator tests `@MainActor` — the coordinator is main-actor isolated and its callbacks use
   `MainActor.assumeIsolated`, which keeps flows synchronous and avoids expectation plumbing.
 - Use `ProcessInfo`-style monotonic `TimeInterval` timestamps in distance tests, not `Date`.
-- Prefer exercising the pure seam (e.g. `provider.ingest(...)`) over standing up a real session.
+- Prefer exercising the pure seam (e.g. `provider.ingest(...)`, `ListeningBufferRules` /
+  `CaptureSampleStore` for the WhisperKit listening decisions, `RecognitionFlushRules` for the flush
+  outcome) over standing up a real session or a real model.
 - After adding a test file: **`xcodegen generate`**.
 
 ---

@@ -2,15 +2,16 @@ import Combine
 import Foundation
 import SwiftUI
 
-/// Drives the screening flow: setup to distance lock, warm-up, high-contrast gate,
+/// Drives the screening flow: setup to distance lock, warm-up, high-contrast acuity,
 /// randomized low-contrast red/green, and results. An `ObservableObject` that publishes the state
 /// SwiftUI screens render.
 ///
 /// The acuity rules live in ``AcuityStaircaseEngine``; sizing in ``OptotypeSizing`` (against the
 /// injected ``ScreenCalibrationProviding``); colors in ``ContrastPalette``; distance policy in
 /// ``DistanceStabilityEvaluator`` + ``DistanceBandGate``. The coordinator wires them together,
-/// owns the session record, and enforces the protocol (e.g. the gate blocking low-contrast,
-/// randomized condition order, distance-invalid pause/repeat, provenance-validated scoring).
+/// owns the session record, and enforces the protocol (e.g. all three scored conditions always
+/// run — the 20/25 result is recorded, never a flow branch — randomized condition order,
+/// distance-invalid pause/repeat, provenance-validated scoring).
 @MainActor
 final class MyopiaScreenCoordinator: ObservableObject {
 
@@ -42,6 +43,16 @@ final class MyopiaScreenCoordinator: ObservableObject {
     /// Transient "that didn't work — try again" notice after a voided hold; clears itself after
     /// `captureRetryNoticeSeconds` (gold retry-notice behavior).
     @Published private(set) var captureRetryNotice: String?
+    /// True during the inter-stimulus blank: a stimulus is committed but the square renders black
+    /// and the letter is hidden, so one letter never swaps straight into the next. Recognition is
+    /// deliberately NOT armed until it clears — an answer must never be timed from a blank field.
+    @Published private(set) var isBlankInterval = false
+    /// Operator-facing "Heard" line: what the live recognizer last transcribed and how it
+    /// classified, for the letter it was shown against. Display only — trials are resolved
+    /// solely through the `recognizeOneLetter` callback — and kept across the inter-letter
+    /// transition so the operator can still read the previous letter's result; nil when no
+    /// service narrates (mock, keypad) and after every presentation teardown.
+    @Published private(set) var lastHeard: HeardDiagnostic?
 
     /// State machine of the operator-initiated capture (port of the gold `CaptureState`).
     enum DistanceCaptureState: Equatable {
@@ -125,13 +136,19 @@ final class MyopiaScreenCoordinator: ObservableObject {
     /// Bumped whenever recognition is cancelled so a callback already in flight becomes a no-op.
     private var recognitionGeneration = 0
     private var retryPolicy: RetryEscalationPolicy
+    /// Consecutive scored voice trials that ended in the no-input window; the backstop hands the
+    /// next letter to the keypad at `config.noInputTrialsBeforeEscalation`.
+    private var consecutiveNoInputTrials = 0
     private var promptThrottle: PromptThrottle
     /// Set when `listen()` was deferred because the announcer was speaking; the speech-finished
     /// event re-arms it after the configured delay.
     private var pendingListenAfterSpeech = false
     private var speechEventsSub: AnyCancellable?
     private var captureEventsSub: AnyCancellable?
+    private var diagnosticsSub: AnyCancellable?
     private var okDismissTask: Task<Void, Never>?
+    /// The in-flight inter-stimulus blank; cancelled by every presentation teardown path.
+    private var blankIntervalTask: Task<Void, Never>?
     /// Bumped whenever the presentation context is torn down (phase clear, back-navigation,
     /// teardown), so a deferred prompt completion or re-arm task from the old context no-ops.
     private var presentationEpoch = 0
@@ -222,6 +239,7 @@ final class MyopiaScreenCoordinator: ObservableObject {
                     guard epoch == self.presentationEpoch,
                           self.listeningStatus == .speaking,
                           !self.isPausedForDistance,
+                          !self.isBlankInterval,
                           self.currentStimulus != nil else { return }
                     self.listen()
                 }
@@ -231,6 +249,24 @@ final class MyopiaScreenCoordinator: ObservableObject {
             .sink { [weak self] event in
                 MainActor.assumeIsolated { self?.handleCaptureEvent(event) }
             }
+        diagnosticsSub = (speech as? RecognitionDiagnosticsProviding)?.diagnostics
+            .sink { [weak self] diagnostic in
+                MainActor.assumeIsolated { self?.handleDiagnostic(diagnostic) }
+            }
+    }
+
+    /// Mirrors the recognizer's narration into ``lastHeard``. A `.listening` diagnostic arrives
+    /// as soon as the next letter is armed — 0.25 s after the previous one resolved — so it must
+    /// NOT wipe that letter's result; it only fills an empty line. Every other kind replaces it.
+    private func handleDiagnostic(_ diagnostic: RecognitionDiagnostic) {
+        if case .listening = diagnostic.kind, lastHeard != nil { return }
+        // A deferral narrates a window that is still open; one that lands after the trial
+        // resolved or was cancelled must not overwrite the result the operator is reading.
+        if case .deferredDeadline = diagnostic.kind, listeningStatus != .listening { return }
+        lastHeard = HeardDiagnostic(
+            text: HeardDiagnosticFormatter.text(for: diagnostic, shownLetter: currentLetter),
+            shownLetter: currentLetter,
+            at: diagnostic.at)
     }
 
     private func handleCaptureEvent(_ event: CaptureEvent) {
@@ -242,8 +278,10 @@ final class MyopiaScreenCoordinator: ObservableObject {
         case .interruptionBegan:
             cancelRecognition()
         case .interruptionEnded, .routeChanged:
-            // The engine was rebuilt; re-arm recognition on the letter still on screen.
-            guard isTrialPhase, !isPausedForDistance, currentStimulus != nil else { return }
+            // The engine was rebuilt; re-arm recognition on the letter still on screen (never
+            // mid-blank — the letter is not visible yet).
+            guard isTrialPhase, !isPausedForDistance, !isBlankInterval,
+                  currentStimulus != nil else { return }
             listen()
         case .failed(let failure):
             serviceAlert = failure
@@ -312,13 +350,16 @@ final class MyopiaScreenCoordinator: ObservableObject {
     func teardown() {
         presentationEpoch &+= 1
         pendingListenAfterSpeech = false
+        cancelBlankInterval()
         resetCaptureFlow()
         distance.stop()
-        speech.cancel()
+        // Through cancelRecognition so the generation bumps: a service callback already
+        // dispatched to the main queue must find a dead context, exactly as on back-navigation.
+        cancelRecognition()
         capture?.endCaptureSession()
-        fallback.cancel()
         announcer.setMicrophoneCaptureActive(false)
         announcer.stop()
+        lastHeard = nil
         brightness.restore()
     }
 
@@ -336,6 +377,7 @@ final class MyopiaScreenCoordinator: ObservableObject {
     func handleBackground() {
         presentationEpoch &+= 1
         pendingListenAfterSpeech = false
+        cancelBlankInterval()
         cancelRecognition()
         capture?.endCaptureSession()
         announcer.setMicrophoneCaptureActive(false)
@@ -448,6 +490,7 @@ final class MyopiaScreenCoordinator: ObservableObject {
         // completion synchronously, and it must find a dead context.
         presentationEpoch &+= 1
         pendingListenAfterSpeech = false
+        cancelBlankInterval()
         cancelRecognition()
         announcer.stop()
         okDismissTask?.cancel()
@@ -459,6 +502,8 @@ final class MyopiaScreenCoordinator: ObservableObject {
         activeCondition = nil
         currentLetter = ""
         stimulusShownAt = nil
+        consecutiveNoInputTrials = 0
+        lastHeard = nil
     }
 
     /// Rolls back transient run state and the session record that the abandoned phase wrote, so the
@@ -675,6 +720,7 @@ final class MyopiaScreenCoordinator: ObservableObject {
     /// after re-lock.
     private func pauseForDistance(status: DistanceStatus) {
         isPausedForDistance = true
+        cancelBlankInterval()
         currentStimulus = nil
         currentSizingDistanceCM = nil
         cancelRecognition()
@@ -773,10 +819,16 @@ final class MyopiaScreenCoordinator: ObservableObject {
 
     /// Warm-up trials are unscored, but the retry/escalation policy applies here too — warm-up is
     /// exactly where a dead microphone is caught before anything is scored. A clean recognition
-    /// advances; failures re-prompt with a fresh letter until the cap escalates to the keypad.
+    /// advances; failures re-prompt with a fresh letter (blanked while the first re-prompt plays,
+    /// as on the scored path) until the cap escalates to the keypad.
+    ///
+    /// A spoken skip counts as a completed practice letter (a heard "skip" proves the voice path
+    /// works). Silence deliberately KEEPS the retry → keypad path here rather than the scored
+    /// trials' no-input rule: the no-input rule — recorded but uncounted, fresh letter — and its
+    /// backstop apply to scored trials only (user decision, PROTOCOL §3).
     private func handleWarmupOutcome(_ outcome: RecognitionOutcome) {
         switch outcome {
-        case .letter:
+        case .letter, .skipped:
             retryPolicy.trialResolved(byVoice: inputMode == .voice)
             inputMode = retryPolicy.isStickyManual ? .manualFallback(sticky: true) : .voice
             warmupCompleted += 1
@@ -796,8 +848,19 @@ final class MyopiaScreenCoordinator: ObservableObject {
             listeningStatus = operatorStatus(for: outcome)
             switch retryPolicy.actionForFailedAttempt() {
             case .retry(let withPrompt):
-                if withPrompt { announcer.speak(.tryAgain) }
-                presentWarmupLetter()
+                guard withPrompt else {
+                    presentWarmupLetter()
+                    return
+                }
+                // As on the scored path: blank while the re-prompt plays (the microphone is off
+                // during speech) and present the fresh letter in the completion.
+                isBlankInterval = true
+                let epoch = presentationEpoch
+                announcer.speak(.tryAgain) { [weak self] in
+                    guard let self, epoch == self.presentationEpoch,
+                          !self.isPausedForDistance, self.phase == .warmup else { return }
+                    self.presentWarmupLetter()
+                }
             case .escalateToManual:
                 escalateCurrentPresentation()
             }
@@ -811,7 +874,10 @@ final class MyopiaScreenCoordinator: ObservableObject {
 
     private func startCondition(_ condition: ColorCondition) {
         activeCondition = condition
-        engine = AcuityStaircaseEngine(config: config.staircaseConfig(gated: condition == .highContrast))
+        let gated = condition == .highContrast
+        engine = AcuityStaircaseEngine(config: config.staircaseConfig(
+            gated: gated,
+            startAcuity: gated ? nil : lowContrastStartAcuity))
         if inputMode == .voice {
             capture?.beginCaptureSession()
         }
@@ -892,6 +958,10 @@ final class MyopiaScreenCoordinator: ObservableObject {
             service = fallback
             listeningStatus = .escalatedToClinician
         } else {
+            // A keypad escalation closes the block's capture session (the microphone path just
+            // proved unusable). The first voice letter after it re-opens the warm engine and the
+            // interruption/route observers — idempotent while a session is already open.
+            capture?.beginCaptureSession()
             service = speech
             listeningStatus = .listening
         }
@@ -938,12 +1008,39 @@ final class MyopiaScreenCoordinator: ObservableObject {
         guard let engine, let condition = activeCondition else { return }
 
         switch outcome {
+        case .skipped:
+            // "Skip" is an answer: the child cannot see the letter. Scored as a miss, never
+            // retried (PROTOCOL §7).
+            consecutiveNoInputTrials = 0
+            score(response: TrialResult.NonLetterResponse.skipped, condition: condition,
+                  engine: engine, responseDistanceCM: responseDistanceCM)
+        case .unrecognized(.silence) where inputMode == .voice:
+            // The (soft) no-input window elapsed with no speech-length sound and no usable text
+            // from an ARMED microphone (a never-armed mic is .serviceFailure; a filler /
+            // unintelligible pass earlier in the window is reported as that outcome, so this
+            // really is silence). Since 2026-09-03 the trial is RECORDED as an incorrect
+            // "no input registered" row but does NOT count toward the staircase: the level does
+            // not move and a FRESH letter replaces it (PROTOCOL §7). Then the backstop: enough
+            // silent letters in a row hand the NEXT presentation to the keypad — in voice mode
+            // nothing else tells the operator, and it is the only exit from a same-level loop.
+            consecutiveNoInputTrials += 1
+            let escalateNext = consecutiveNoInputTrials >= config.noInputTrialsBeforeEscalation
+            score(response: TrialResult.NonLetterResponse.noInput, condition: condition,
+                  engine: engine, responseDistanceCM: responseDistanceCM,
+                  provesVoicePath: false, countsTowardStaircase: false)
+            if escalateNext, isTrialPhase, !isPausedForDistance, currentStimulus != nil {
+                consecutiveNoInputTrials = 0
+                retryPolicy.noteNoInputEscalation()
+                escalateCurrentPresentation()
+            }
         case .ambiguous, .unrecognized:
             if case .manualFallback = inputMode {
                 // Keypad "No response": scored as incorrect (clinical decision) — the staircase
                 // must be able to terminate for a child who cannot see or will not answer,
                 // exactly like a missed letter on a physical chart.
-                score(response: "-", condition: condition, engine: engine,
+                consecutiveNoInputTrials = 0
+                score(response: TrialResult.NonLetterResponse.clinicianNoResponse,
+                      condition: condition, engine: engine,
                       responseDistanceCM: responseDistanceCM)
                 return
             }
@@ -952,8 +1049,20 @@ final class MyopiaScreenCoordinator: ObservableObject {
             case .retry(let withPrompt):
                 // The first retry carries a spoken re-prompt; later retries stay silent so a
                 // hesitant child isn't nagged every few seconds.
-                if withPrompt { announcer.speak(.tryAgain) }
-                repeatCurrentTrial()
+                guard withPrompt else {
+                    repeatCurrentTrial()
+                    return
+                }
+                // Blank the square while the re-prompt plays (the microphone is deliberately off
+                // during speech) and re-present in the completion, as the phase intro does: a
+                // letter that invites an answer nobody can hear would end as a no-input row.
+                isBlankInterval = true
+                let epoch = presentationEpoch
+                announcer.speak(.tryAgain) { [weak self] in
+                    guard let self, epoch == self.presentationEpoch,
+                          !self.isPausedForDistance, self.isTrialPhase else { return }
+                    self.repeatCurrentTrial()
+                }
             case .escalateToManual:
                 escalateCurrentPresentation()
             }
@@ -963,15 +1072,29 @@ final class MyopiaScreenCoordinator: ObservableObject {
             _ = retryPolicy.actionForServiceFailure()
             escalateCurrentPresentation()
         case .letter(let response):
+            consecutiveNoInputTrials = 0
             score(response: response, condition: condition, engine: engine,
                   responseDistanceCM: responseDistanceCM)
         }
     }
 
-    /// The single scored path for voice letters and keypad entries (including "no response").
+    /// The single resolution path for voice letters, spoken skips, voice no-input, and keypad
+    /// entries (including "no response"). Non-letter responses are the
+    /// ``TrialResult/NonLetterResponse`` sentinels and are incorrect by construction.
+    ///
+    /// `provesVoicePath` is false for a voice no-input: silence says nothing about whether the
+    /// microphone path works, so it must not clear the consecutive-escalation streak — otherwise
+    /// a child who never speaks could bounce keypad → voice → keypad forever without manual mode
+    /// ever becoming sticky.
+    ///
+    /// `countsTowardStaircase` is false for a voice no-input (user decision 2026-09-03,
+    /// superseding the 09-02 "silence scores a miss" rule): the row is recorded, the engine is
+    /// NOT fed, the level does not move, and a fresh letter is presented in its place. Every
+    /// other resolution counts, including keypad "No response" (`-`) and a spoken skip.
     private func score(response: String, condition: ColorCondition, engine: AcuityStaircaseEngine,
-                       responseDistanceCM: Double) {
-        // A response is scored only when the sizing lineage of the letter on screen is still
+                       responseDistanceCM: Double, provesVoicePath: Bool = true,
+                       countsTowardStaircase: Bool = true) {
+        // A response is resolved only when the sizing lineage of the letter on screen is still
         // valid against the LIVE calibration (gold-standard rule): a mid-session calibration
         // change pauses instead of mis-scoring.
         guard let provenance = currentStimulus?.spec.provenance,
@@ -980,13 +1103,20 @@ final class MyopiaScreenCoordinator: ObservableObject {
             pausePresentation()
             return
         }
-        retryPolicy.trialResolved(byVoice: inputMode == .voice)
+        retryPolicy.trialResolved(byVoice: provesVoicePath && inputMode == .voice)
         // Escalation is per-trial: a resolved keypad trial hands the NEXT trial back to voice,
         // unless enough consecutive escalations made manual mode sticky.
         inputMode = retryPolicy.isStickyManual ? .manualFallback(sticky: true) : .voice
         let correct = response == currentLetter
         recordTrial(condition: condition, response: response, correct: correct,
-                    responseDistanceCM: responseDistanceCM, provenance: provenance)
+                    responseDistanceCM: responseDistanceCM, provenance: provenance,
+                    countsTowardStaircase: countsTowardStaircase)
+        guard countsTowardStaircase else {
+            // Logged, never scored: the engine's counters are untouched, so the replacement
+            // letter is presented at the same level and reuses the same within-level slot.
+            presentTrial()
+            return
+        }
         let event = engine.record(correct: correct)
         switch event {
         case .continueSameLevel, .advance, .stepBack:
@@ -1024,12 +1154,15 @@ final class MyopiaScreenCoordinator: ObservableObject {
         case .unrecognized(.filler): return .heardFiller
         case .unrecognized(.silence): return .heardNothing
         case .unrecognized(.unintelligible): return .heardUnintelligible
-        case .letter, .serviceFailure: return .idle
+        case .letter, .skipped, .serviceFailure: return .idle
         }
     }
 
+    /// `countsTowardStaircase` is written EXPLICITLY on every row (true or false), never nil:
+    /// nil then means exactly "written before 2026-09-03", all of which were counted.
     private func recordTrial(condition: ColorCondition, response: String, correct: Bool,
-                             responseDistanceCM: Double, provenance: SizingProvenance) {
+                             responseDistanceCM: Double, provenance: SizingProvenance,
+                             countsTowardStaircase: Bool = true) {
         let latencyMS = stimulusShownAt.map { Int(Date().timeIntervalSince($0) * 1000) } ?? 0
         let trial = TrialResult(
             condition: condition,
@@ -1041,14 +1174,37 @@ final class MyopiaScreenCoordinator: ObservableObject {
             sizingDistanceCM: currentSizingDistanceCM,
             responseTimeMS: latencyMS,
             // Recorded BEFORE the engine consumes the response, so this is the 1-based
-            // within-level number of the trial being answered (gold `nextTrialNumber`).
+            // within-level number of the trial being answered (gold `nextTrialNumber`). An
+            // uncounted row never feeds the engine, so its replacement reuses the same number.
             trialNumber: engine?.nextTrialNumber ?? 0,
             timestamp: Date(),
-            provenance: provenance)
+            provenance: provenance,
+            countsTowardStaircase: countsTowardStaircase)
         mutableSession.trials.append(trial)
     }
 
     // MARK: - Condition completion
+
+    /// Where the low-contrast staircases begin: ``ScreenConfig/lowContrastStartOffsetSteps`` rungs
+    /// COARSER (bigger letters) than the finest line the child actually PASSED under high
+    /// contrast. A low-contrast letter is harder to read than the same-size high-contrast one, so
+    /// the run is anchored to the child's own demonstrated acuity rather than a fixed level.
+    ///
+    /// Derived on demand from the recorded result rather than held as run state, so it follows
+    /// `mutableSession.highContrast` for free: `resetRunStateForBack()` clears it (a re-run
+    /// re-derives), and `clearTrialRunState()` preserves it (a forward skip between the two
+    /// low-contrast conditions keeps the same anchor). Nil means the operator skipped the gate
+    /// with Next and there is nothing to anchor to — fall back to the protocol start.
+    ///
+    /// The anchor can be any rung: low contrast runs regardless of the 20/25 result, and when no
+    /// high-contrast line was passed `finestAcuityDenominator` is the coarser terminal line, so
+    /// the clamp to the coarsest rung (20/200) in `acuityLevel(coarserBy:than:)` is load-bearing.
+    private var lowContrastStartAcuity: Int {
+        guard let reached = mutableSession.highContrast?.finestAcuityDenominator else {
+            return config.startAcuity
+        }
+        return config.acuityLevel(coarserBy: config.lowContrastStartOffsetSteps, than: reached)
+    }
 
     private func finishCondition(_ condition: ColorCondition, result: AcuityLevelResult) {
         let conditionResult = AcuityConditionResult(
@@ -1059,14 +1215,12 @@ final class MyopiaScreenCoordinator: ObservableObject {
 
         switch condition {
         case .highContrast:
+            // `reachedGate` is recorded for analysis only. The low-contrast conditions ALWAYS
+            // run (user decision 2026-09-03): a below-20/25 high-contrast result must never
+            // silently drop red and teal. The only way a scored condition is skipped is an
+            // explicit operator Next, confirmed in the root view.
             mutableSession.highContrast = conditionResult
-            if result.reachedGate {
-                beginLowContrastSequence()
-            } else {
-                // Gate not passed, so do not run the low-contrast conditions.
-                mutableSession.interpretation = "highContrastBelowGate"
-                completeSession()
-            }
+            beginLowContrastSequence()
         case .lowContrastRed:
             mutableSession.lowContrastRed = conditionResult
             lowContrastResults[condition] = conditionResult
@@ -1111,6 +1265,7 @@ final class MyopiaScreenCoordinator: ObservableObject {
     private func completeSession() {
         mutableSession.completedAt = Date()
         presentationEpoch &+= 1
+        cancelBlankInterval()
         currentStimulus = nil
         cancelRecognition()
         // The microphone must not stay hot on the results screen.
@@ -1147,10 +1302,47 @@ final class MyopiaScreenCoordinator: ObservableObject {
             colors: colors,
             spec: spec,
             acuityDenominator: acuity)
+
+        // Inter-stimulus blank. The stimulus is committed FIRST and blanked in the SAME run-loop
+        // turn, so SwiftUI never gets a frame with the new letter visible before the interval
+        // starts. A zero duration presents synchronously, which is what keeps the coordinator
+        // tests deterministic.
+        blankIntervalTask?.cancel()
+        guard config.interstimulusBlankSeconds > 0 else {
+            isBlankInterval = false
+            revealCurrentStimulus()
+            return
+        }
+        isBlankInterval = true
+        let epoch = presentationEpoch
+        blankIntervalTask = Task { [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(
+                nanoseconds: UInt64(config.interstimulusBlankSeconds * 1_000_000_000))
+            // Reveal only the exact presentation this task was spawned for: same presentation
+            // context, blank still owed, not paused, letter still committed.
+            guard !Task.isCancelled, epoch == self.presentationEpoch, self.isBlankInterval,
+                  !self.isPausedForDistance, self.currentStimulus != nil else { return }
+            self.isBlankInterval = false
+            self.revealCurrentStimulus()
+        }
+    }
+
+    /// The tail of a presentation, run once the letter is actually visible: prompt (when
+    /// configured) and arm recognition. Never called while blanked.
+    private func revealCurrentStimulus() {
         if config.speakEveryTrialPrompt, phase != .warmup {
             announcer.speak(.sayTheLetter)
         }
         listen()
+    }
+
+    /// Ends any in-flight blank and returns the square to its normal rendering. Called from every
+    /// presentation teardown path so a cancelled blank can never leave the square stuck black.
+    private func cancelBlankInterval() {
+        blankIntervalTask?.cancel()
+        blankIntervalTask = nil
+        isBlankInterval = false
     }
 
     /// Sizing distance: a fresh valid sample from the provider, or nothing — the presentation
@@ -1175,6 +1367,7 @@ final class MyopiaScreenCoordinator: ObservableObject {
 
     /// Hides the stimulus and pauses because it can no longer be presented truthfully.
     private func pausePresentation() {
+        cancelBlankInterval()
         currentStimulus = nil
         currentSizingDistanceCM = nil
         isPausedForDistance = true
@@ -1187,6 +1380,10 @@ final class MyopiaScreenCoordinator: ObservableObject {
     /// height moved at least half a physical pixel (or the calibration identity changed). A damped
     /// candidate never overwrites the visible spec, so recorded provenance always describes what
     /// was actually on screen.
+    ///
+    /// Deliberately runs during an inter-stimulus blank too: it republishes the SAME letter at a
+    /// fresher size, nothing is visible while blanked, and the letter then appears at the newer
+    /// size. No blank is started here — this is not a letter transition.
     private func resizeVisibleStimulus(distanceCM: Double) {
         guard let stimulus = currentStimulus, let cal = sessionCalibration else { return }
         guard let font = try? OptotypeSizing.sloanBaseFont(),

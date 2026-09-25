@@ -7,6 +7,11 @@ struct ScreeningRootView: View {
     @StateObject private var coordinator: MyopiaScreenCoordinator
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.dismiss) private var dismiss
+    /// The scored phase a pending Next confirmation would skip. Captured when the dialog opens,
+    /// so a condition that finishes on its own while the dialog is up can never hand the Skip
+    /// to the NEXT condition.
+    @State private var pendingSkipPhase: ScreenPhase?
+    @State private var showSkipConfirmation = false
 
     private let clinician: ManualClinicianService?
     private let whisperService: WhisperKitLetterRecognitionService?
@@ -35,7 +40,7 @@ struct ScreeningRootView: View {
 
         if ARFaceTrackingConfiguration.isSupported {
             let ar = ARKitDistanceProvider(config: config)
-            let speech = WhisperKitLetterRecognitionService()
+            let speech = WhisperKitLetterRecognitionService(config: config)
             _coordinator = StateObject(wrappedValue: MyopiaScreenCoordinator(
                 config: config, distance: ar, speech: speech, fallback: manual,
                 announcer: announcer,
@@ -87,6 +92,23 @@ struct ScreeningRootView: View {
             } message: {
                 Text(serviceAlertMessage)
             }
+            .confirmationDialog("Skip this test?",
+                                isPresented: $showSkipConfirmation,
+                                titleVisibility: .visible,
+                                presenting: pendingSkipPhase) { phase in
+                Button("Skip", role: .destructive) {
+                    // Only the phase the operator was looking at when the dialog opened.
+                    if coordinator.phase == phase { coordinator.goNext() }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: { phase in
+                Text("No result will be recorded for the \(skipTargetName(phase)) test.")
+            }
+    }
+
+    /// Dialog wording: "high contrast", "low-contrast red", "low-contrast teal".
+    private func skipTargetName(_ phase: ScreenPhase) -> String {
+        phase.scoredCondition?.displayName.lowercased() ?? "current"
     }
 
     private var serviceAlertMessage: String {
@@ -118,13 +140,21 @@ struct ScreeningRootView: View {
     }
 
     /// A single Next control shared across the in-flow test screens. Skips the current test (no
-    /// result recorded) and advances to the start of the next phase. Not shown on `.setup`, where
-    /// the permission-gated "Begin" button handles the transition.
+    /// result recorded) and advances to the start of the next phase. On a scored condition the
+    /// skip is confirmed first — a dropped result is permanent, and a distance pause renders
+    /// every phase as the same black field, so "unstick it" and "skip it" must not be the same
+    /// gesture. Distance-lock and warm-up advance immediately. Not shown on `.setup`, where the
+    /// permission-gated "Begin" button handles the transition.
     @ViewBuilder
     private var nextButton: some View {
         if showsNextButton {
             Button {
-                coordinator.goNext()
+                if coordinator.phase.scoredCondition != nil {
+                    pendingSkipPhase = coordinator.phase
+                    showSkipConfirmation = true
+                } else {
+                    coordinator.goNext()
+                }
             } label: {
                 Label("Next", systemImage: "chevron.right")
                     .labelStyle(.titleAndIcon)

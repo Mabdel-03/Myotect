@@ -102,4 +102,59 @@ final class LetterMappingTableTests: XCTestCase {
             XCTAssertTrue(LetterMappingTable.sloanSet.contains(value), "\(value) not in Sloan set")
         }
     }
+
+    // MARK: - Spoken skip
+
+    func testClassifySkipAndWhisperVariants() {
+        for phrase in ["skip", "Skip.", "SKIP!", "  skip  ", "skipped", "skips", "skipping", "skype"] {
+            XCTAssertEqual(LetterMappingTable.classify(phrase), .skipped, "\"\(phrase)\"")
+        }
+        for phrase in LetterMappingTable.skipPhrases {
+            XCTAssertEqual(LetterMappingTable.classify(phrase), .skipped, "\"\(phrase)\"")
+        }
+    }
+
+    func testClassifySkipWithFillerOrTailIsSkip() {
+        // A hesitation before, or a tail after, must not hide the skip — and a hallucinated
+        // "thank you" tail is not a letter either.
+        for phrase in ["um skip", "Uh, skip.", "skip it", "skip this one", "please skip",
+                       "skip thank you"] {
+            XCTAssertEqual(LetterMappingTable.classify(phrase), .skipped, "\"\(phrase)\"")
+        }
+    }
+
+    func testClassifySkipMixedWithLetterIsAmbiguous() {
+        // A skip beside a letter is a mixed utterance: retry rather than guess. "okay skip" is
+        // the known cost — "okay" is a K correction — pinned here so nobody "fixes" it blind.
+        for phrase in ["c skip", "skip see", "okay skip", "S, skip"] {
+            XCTAssertEqual(LetterMappingTable.classify(phrase), .ambiguous, "\"\(phrase)\"")
+        }
+    }
+
+    func testTierTwoSkipVariantsAreNotSkips() {
+        // "ski" / "kip" / "skit" / "skid" / "skiff" are deliberately excluded: Whisper can fuse
+        // an "S… K" self-correction into such a word, and a false skip is a scored miss whereas
+        // a missed skip is only a retry. "S K" itself must stay ambiguous (a correction).
+        for phrase in ["ski", "kip", "skit", "skid", "skiff"] {
+            XCTAssertEqual(LetterMappingTable.classify(phrase), .unrecognized(.unintelligible),
+                           "\"\(phrase)\"")
+        }
+        XCTAssertEqual(LetterMappingTable.classify("S K"), .ambiguous)
+    }
+
+    func testSkipPhrasesNeverCollideWithLetterTables() {
+        // Guardrail (mirror of the filter's): no skip phrase may resolve to a Sloan letter
+        // through ANY layer, or a real answer would be scored as a skipped miss.
+        for phrase in LetterMappingTable.skipPhrases {
+            XCTAssertEqual(phrase, LetterMappingTable.normalize(phrase),
+                           "\"\(phrase)\" must be stored pre-normalized")
+            XCTAssertNil(LetterMappingTable.letter(forTranscript: phrase),
+                         "Skip phrase \"\(phrase)\" also maps to a Sloan letter")
+            XCTAssertNil(LetterMappingTable.phonetics[phrase],
+                         "Skip phrase \"\(phrase)\" is a phonetics key")
+            XCTAssertNil(LetterMappingTable.misidentifications[phrase],
+                         "Skip phrase \"\(phrase)\" is a misidentifications key")
+            XCTAssertFalse(LetterMappingTable.sloanSet.contains(phrase.uppercased()))
+        }
+    }
 }

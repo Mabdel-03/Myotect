@@ -91,9 +91,10 @@ struct ResultsView: View {
                     .myoHeader2()
                     .lineLimit(1)
                     .minimumScaleFactor(0.6)
-                row("High-contrast acuity", session.highContrast)
-                row("Red low-contrast acuity", session.lowContrastRed)
-                row("Teal low-contrast acuity", session.lowContrastGreen)
+                let missing = missingLabel(session)
+                row("High-contrast acuity", session.highContrast, missing: missing)
+                row("Red low-contrast acuity", session.lowContrastRed, missing: missing)
+                row("Teal low-contrast acuity", session.lowContrastGreen, missing: missing)
                 if let delta = session.duochromeDeltaLogMAR {
                     Text(String(format: "Red-teal delta: %+.2f logMAR", delta))
                         .font(.system(size: 18).monospacedDigit())
@@ -102,7 +103,12 @@ struct ResultsView: View {
                 Text(String(format: "Low contrast: %.0f%% Weber", session.weberContrast * 100))
                     .font(.system(size: 18).monospacedDigit())
                     .foregroundStyle(Color.myoGrayText)
-                let validTrials = session.trials.map(\.distanceCM)
+                // The clinician reads `n` as "letters the result rests on": uncounted no-input
+                // rows never reached the staircase, so they are left out (legacy rows decode
+                // nil ⇒ counted). Same filter analysts apply to the export.
+                let validTrials = session.trials
+                    .filter { $0.countsTowardStaircase ?? true }
+                    .map(\.distanceCM)
                 if !validTrials.isEmpty {
                     let mean = validTrials.reduce(0, +) / Double(validTrials.count)
                     Text(String(format: "Distance mean: %.0f cm (n=%d trials)", mean, validTrials.count))
@@ -117,7 +123,15 @@ struct ResultsView: View {
         }
     }
 
-    private func row(_ label: String, _ result: AcuityConditionResult?) -> some View {
+    /// Wording for a condition with no result. Since 2026-09-03 the flow never drops a
+    /// condition on its own, so a nil result means the operator skipped it — except in sessions
+    /// saved by earlier builds, where the 20/25 gate ended the session before low contrast ran.
+    private func missingLabel(_ session: MyopiaScreenSession) -> String {
+        session.interpretation == "highContrastBelowGate" ? "Not run" : "Skipped"
+    }
+
+    private func row(_ label: String, _ result: AcuityConditionResult?,
+                     missing: String) -> some View {
         HStack {
             Text(label)
                 .font(.system(size: 18))
@@ -130,7 +144,7 @@ struct ResultsView: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
             } else {
-                Text("N/A")
+                Text(missing)
                     .font(.system(size: 18))
                     .foregroundStyle(Color.myoGrayText)
             }

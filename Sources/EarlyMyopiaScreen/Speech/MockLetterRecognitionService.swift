@@ -44,7 +44,10 @@ final class MockLetterRecognitionService: LetterRecognitionService {
             let wrong = SloanLetter.all.first { $0 != shown } ?? shown
             return .letter(wrong)
         }
-        guard index < answers.count else { return .unrecognized(.silence) }
+        // Past the end of the script: a non-answer that RETRIES the same letter. Never `.silence`,
+        // which the scored voice path records as an uncounted "no input registered" row and
+        // replaces with a fresh letter — an exhausted script would otherwise flood the log.
+        guard index < answers.count else { return .unrecognized(.unintelligible) }
         defer { index += 1 }
         return answers[index]
     }

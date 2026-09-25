@@ -99,4 +99,18 @@ final class WhisperTranscriptFilterTests: XCTestCase {
             }
         }
     }
+
+    func testSkipPhrasesReachTheMapper() {
+        // The filter runs FIRST; a skip must never be swallowed as filler or silence — alone, or
+        // beside a filler / a hallucinated tail — and must not appear in either rejection set.
+        for phrase in LetterMappingTable.skipPhrases {
+            XCTAssertNil(WhisperTranscriptFilter.nonAnswerKind(phrase), "\"\(phrase)\"")
+            XCTAssertFalse(WhisperTranscriptFilter.fillerExact.contains(phrase))
+            XCTAssertFalse(WhisperTranscriptFilter.nonAnswerExact.contains(phrase))
+        }
+        for phrase in ["um skip", "Uh, skip.", "skip thank you", "skip you"] {
+            XCTAssertNil(WhisperTranscriptFilter.nonAnswerKind(phrase), "\"\(phrase)\"")
+            XCTAssertEqual(LetterMappingTable.classify(phrase), .skipped, "\"\(phrase)\"")
+        }
+    }
 }

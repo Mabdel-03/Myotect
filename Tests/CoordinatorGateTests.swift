@@ -40,7 +40,10 @@ private final class ManualDistanceProvider: DistanceProvider {
 private final class ScriptedSpeechService: LetterRecognitionService {
     let isAvailable = true
     private var pending: ((RecognitionOutcome) -> Void)?
+    /// The no-input window the coordinator armed the last request with.
+    private(set) var lastTimeout: TimeInterval?
     func recognizeOneLetter(timeout: TimeInterval, onOutcome: @escaping (RecognitionOutcome) -> Void) {
+        lastTimeout = timeout
         pending = onOutcome
     }
     func cancel() { pending = nil }
@@ -70,11 +73,17 @@ final class CoordinatorGateTests: XCTestCase {
             schemaVersion: ScreenCalibration.schemaVersion)
     }
 
+    /// `blankSeconds` defaults to 0 so the inter-stimulus blank presents SYNCHRONOUSLY: every
+    /// test below drives the flow by answering and immediately reading the next stimulus, which a
+    /// real 0.25 s blank would break. The blank's own tests opt back in with a non-zero value.
     private func makeCoordinator(config: ScreenConfig = ScreenConfig(),
                                  order: [ColorCondition]? = nil,
                                  calibration: ScreenCalibrationProviding? = nil,
-                                 screenShortSidePoints: Double = 393)
+                                 screenShortSidePoints: Double = 393,
+                                 blankSeconds: TimeInterval = 0)
         -> (MyopiaScreenCoordinator, ManualDistanceProvider, ScriptedSpeechService) {
+        var config = config
+        config.interstimulusBlankSeconds = blankSeconds
         let distance = ManualDistanceProvider()
         let speech = ScriptedSpeechService()
         let coordinator = MyopiaScreenCoordinator(
@@ -304,22 +313,35 @@ final class CoordinatorGateTests: XCTestCase {
         XCTAssertNotNil(session?.duochromeDeltaLogMAR)
     }
 
-    func testGateFailSkipsLowContrast() {
-        let (coordinator, distance, speech) = makeCoordinator()
+    /// The 20/25 result is recorded, never a flow branch: a child who never reaches 20/25 under
+    /// high contrast still runs red AND teal (user decision 2026-09-03 — before it, a below-gate
+    /// result ended the session and both low-contrast rows read "N/A" with no operator action).
+    func testBelowGateHighContrastStillRunsBothLowContrastConditions() {
+        let (coordinator, distance, speech) = makeCoordinator(order: [.lowContrastRed, .lowContrastGreen])
         coordinator.beginAfterSetup()
         lockDistance(distance)
         completeWarmup(coordinator, speech)
         XCTAssertEqual(coordinator.phase, .highContrastGate)
 
-        // Fail at the start (always wrong from acuity 40) so the gate is never reached.
+        // Always wrong from acuity 40: the staircase falls to 20/200 and nothing is passed.
         runCondition(coordinator, speech, answerCorrect: { _ in false })
+        XCTAssertEqual(coordinator.phase, .lowContrast(.lowContrastRed))
+        XCTAssertFalse(coordinator.currentSessionSnapshot.highContrast?.reachedGate ?? true)
+
+        runCondition(coordinator, speech, answerCorrect: { _ in true })
+        XCTAssertEqual(coordinator.phase, .lowContrast(.lowContrastGreen))
+        runCondition(coordinator, speech, answerCorrect: { _ in true })
         XCTAssertEqual(coordinator.phase, .results)
 
         let session = coordinator.session
         XCTAssertNotNil(session?.highContrast)
         XCTAssertFalse(session?.highContrast?.reachedGate ?? true)
-        XCTAssertNil(session?.lowContrastRed)
-        XCTAssertNil(session?.lowContrastGreen)
+        XCTAssertNotNil(session?.lowContrastRed)
+        XCTAssertNotNil(session?.lowContrastGreen)
+        XCTAssertNotNil(session?.duochromeDeltaLogMAR)
+        XCTAssertTrue(["redBetterThanGreen_deltaRecorded", "noRedGreenDifference_deltaRecorded"]
+            .contains(session?.interpretation ?? ""))
+        XCTAssertNotEqual(session?.interpretation, "highContrastBelowGate")
     }
 
     func testAmbiguousRepeatsSameLetterWithoutAdvancing() {
@@ -515,11 +537,84 @@ final class CoordinatorGateTests: XCTestCase {
 
     func testSessionRecordsConfiguredWeberContrast() {
         // Closes the injected-config → session-record loop: the operator's contrast setting
-        // (sampled into the config at flow launch) is what the session exports.
+        // (sampled into the config at flow launch) is what the session exports. 0.15 is
+        // deliberately NOT the default (0.20), so this still discriminates.
         var config = ScreenConfig()
         config.lowContrastWeber = 0.15
         let (coordinator, _, _) = makeCoordinator(config: config)
         XCTAssertEqual(coordinator.currentSessionSnapshot.weberContrast, 0.15, accuracy: 1e-9)
+        XCTAssertNotEqual(ScreenConfig().lowContrastWeber, 0.15)
+    }
+
+    // MARK: - No-input window
+
+    /// The only place the window value flows is `listen()`; every fake discards it, so pin it
+    /// here or a regression to a literal (or the old 5 s / 8 s) would ship green.
+    func testListenArmsTheServiceWithTheNoInputWindow() {
+        let (coordinator, distance, speech) = makeCoordinator()
+        coordinator.beginAfterSetup()
+        lockDistance(distance)
+        XCTAssertTrue(speech.hasPending)
+        XCTAssertEqual(speech.lastTimeout, coordinator.config.recognitionTimeoutSeconds)
+        XCTAssertEqual(speech.lastTimeout ?? 0, 10, accuracy: 1e-9)
+    }
+
+    func testNoInputTrialsAreRecordedButNeverMoveTheStaircase() {
+        var config = ScreenConfig()
+        config.noInputTrialsBeforeEscalation = 100   // isolate the rule from the keypad backstop
+        let (coordinator, distance, speech) = makeCoordinator(config: config)
+        coordinator.beginAfterSetup()
+        lockDistance(distance)
+        completeWarmup(coordinator, speech)
+        XCTAssertEqual(coordinator.currentStimulus?.acuityDenominator, 40)
+
+        // Under the 09-02 rule five silent letters failed the line. Since 2026-09-03 each is
+        // logged as an uncounted "no input registered" row and replaced by a FRESH letter at
+        // the SAME level: the engine never sees them.
+        var shown: [String] = []
+        for _ in 0..<5 {
+            let letter = coordinator.currentStimulus?.letter ?? ""
+            shown.append(letter)
+            speech.answer(.unrecognized(.silence))
+            XCTAssertEqual(coordinator.currentStimulus?.acuityDenominator, 40)
+            XCTAssertNotEqual(coordinator.currentStimulus?.letter, letter)
+        }
+        let trials = coordinator.currentSessionSnapshot.trials
+        XCTAssertEqual(trials.count, 5)
+        XCTAssertEqual(trials.map(\.shownLetter), shown)
+        XCTAssertTrue(trials.allSatisfy {
+            $0.response == TrialResult.NonLetterResponse.noInput
+                && !$0.isCorrect && $0.countsTowardStaircase == false
+        })
+        // The engine was never fed, so every row sits in the level's first slot.
+        XCTAssertTrue(trials.allSatisfy { $0.trialNumber == 1 })
+        XCTAssertEqual(coordinator.inputMode, .voice)
+        XCTAssertTrue(speech.hasPending)
+
+        // The staircase resumes exactly where it was: three correct letters early-pass 20/40.
+        for _ in 0..<3 { speech.answer(.letter(coordinator.currentStimulus?.letter ?? "C")) }
+        XCTAssertEqual(coordinator.currentStimulus?.acuityDenominator, 32)
+        XCTAssertEqual(coordinator.currentSessionSnapshot.trials.suffix(3).map(\.trialNumber), [1, 2, 3])
+        XCTAssertTrue(coordinator.currentSessionSnapshot.trials.suffix(3)
+            .allSatisfy { $0.countsTowardStaircase == true })
+    }
+
+    /// `teardown()` must bump the recognition generation like every other teardown path: a
+    /// service callback already dispatched to the main queue would otherwise score a trial into
+    /// a dead session (the manual distance provider still answers "valid").
+    func testLateSilenceAfterTeardownIsDropped() {
+        let (coordinator, distance, speech) = makeCoordinator()
+        coordinator.beginAfterSetup()
+        lockDistance(distance)
+        completeWarmup(coordinator, speech)
+        XCTAssertEqual(coordinator.phase, .highContrastGate)
+        let late = speech.capturePending()
+
+        coordinator.teardown()
+        late?(.unrecognized(.silence))
+
+        XCTAssertTrue(coordinator.currentSessionSnapshot.trials.isEmpty)
+        XCTAssertFalse(speech.hasPending)
     }
 
     // MARK: - Calibration & sizing
@@ -634,7 +729,7 @@ final class CoordinatorGateTests: XCTestCase {
     // MARK: - Back navigation
 
     func testBackFromWarmupReturnsToDistanceLock() {
-        let (coordinator, distance, speech) = makeCoordinator()
+        let (coordinator, distance, _) = makeCoordinator()
         coordinator.beginAfterSetup()
         lockDistance(distance)
         XCTAssertEqual(coordinator.phase, .warmup)
@@ -781,4 +876,233 @@ final class CoordinatorGateTests: XCTestCase {
         XCTAssertFalse(coordinator.goNext())
         XCTAssertEqual(coordinator.phase, .results)
     }
+
+    /// The root view's skip-confirmation dialog keys off this: exactly the three scored phases.
+    func testScoredConditionForPhase() {
+        XCTAssertEqual(ScreenPhase.highContrastGate.scoredCondition, .highContrast)
+        XCTAssertEqual(ScreenPhase.lowContrast(.lowContrastRed).scoredCondition, .lowContrastRed)
+        XCTAssertEqual(ScreenPhase.lowContrast(.lowContrastGreen).scoredCondition, .lowContrastGreen)
+        XCTAssertNil(ScreenPhase.setup.scoredCondition)
+        XCTAssertNil(ScreenPhase.distanceLock.scoredCondition)
+        XCTAssertNil(ScreenPhase.warmup.scoredCondition)
+        XCTAssertNil(ScreenPhase.results.scoredCondition)
+        XCTAssertNil(ScreenPhase.aborted(reason: "x").scoredCondition)
+    }
+
+    /// A confirmed skip drops exactly the one condition: the other two still record, and with one
+    /// low-contrast result missing the delta and its interpretation stay unset.
+    func testSkippingOneLowContrastConditionKeepsTheOtherTwoResults() {
+        let (coordinator, distance, speech) = makeCoordinator(order: [.lowContrastRed, .lowContrastGreen])
+        coordinator.beginAfterSetup()
+        lockDistance(distance)
+        completeWarmup(coordinator, speech)
+        runCondition(coordinator, speech, answerCorrect: { _ in true })
+        XCTAssertEqual(coordinator.phase, .lowContrast(.lowContrastRed))
+
+        XCTAssertTrue(coordinator.goNext())                 // operator skips red
+        XCTAssertEqual(coordinator.phase, .lowContrast(.lowContrastGreen))
+        runCondition(coordinator, speech, answerCorrect: { _ in true })
+        XCTAssertEqual(coordinator.phase, .results)
+
+        let session = coordinator.session
+        XCTAssertNotNil(session?.highContrast)
+        XCTAssertNil(session?.lowContrastRed)
+        XCTAssertNotNil(session?.lowContrastGreen)
+        XCTAssertNil(session?.duochromeDeltaLogMAR)
+        XCTAssertEqual(session?.interpretation, "notComputed")
+    }
+
+    // MARK: - Low-contrast starting level (2 steps coarser than the high-contrast result)
+
+    /// A child who passes 20/20 (failing only 20/16) starts low contrast at 20/32: two rungs
+    /// coarser than the finest line they actually passed.
+    func testLowContrastStartsTwoStepsCoarserThanHighContrastResult() {
+        let (coordinator, distance, speech) = makeCoordinator(order: [.lowContrastRed, .lowContrastGreen])
+        coordinator.beginAfterSetup()
+        lockDistance(distance)
+        completeWarmup(coordinator, speech)
+
+        // Correct down to 20/20, wrong at 20/16 → finest PASSED line is 20/20.
+        runCondition(coordinator, speech, answerCorrect: { $0 >= 20 })
+        XCTAssertEqual(coordinator.phase, .lowContrast(.lowContrastRed))
+        XCTAssertEqual(coordinator.currentSessionSnapshot.highContrast?.finestAcuityDenominator, 20)
+        XCTAssertEqual(coordinator.currentStimulus?.acuityDenominator, 32)
+    }
+
+    /// A child at exactly the 20/25 gate starts low contrast at 20/40 — identical to the fixed
+    /// `startAcuity` the protocol used before, so the gate-edge case is unchanged.
+    func testLowContrastStartAtGateEdgeMatchesProtocolStart() {
+        let (coordinator, distance, speech) = makeCoordinator(order: [.lowContrastRed, .lowContrastGreen])
+        coordinator.beginAfterSetup()
+        lockDistance(distance)
+        completeWarmup(coordinator, speech)
+
+        runCondition(coordinator, speech, answerCorrect: { $0 >= 25 })
+        XCTAssertEqual(coordinator.phase, .lowContrast(.lowContrastRed))
+        XCTAssertEqual(coordinator.currentSessionSnapshot.highContrast?.finestAcuityDenominator, 25)
+        XCTAssertEqual(coordinator.currentStimulus?.acuityDenominator, 40)
+        XCTAssertEqual(coordinator.currentStimulus?.acuityDenominator, coordinator.config.startAcuity)
+    }
+
+    /// Both low-contrast conditions derive independently from the HIGH-CONTRAST result: the
+    /// second is never chained off the first condition's outcome.
+    func testBothLowContrastConditionsStartAtTheSameDerivedLevel() {
+        let (coordinator, distance, speech) = makeCoordinator(order: [.lowContrastRed, .lowContrastGreen])
+        coordinator.beginAfterSetup()
+        lockDistance(distance)
+        completeWarmup(coordinator, speech)
+
+        runCondition(coordinator, speech, answerCorrect: { $0 >= 20 })
+        XCTAssertEqual(coordinator.phase, .lowContrast(.lowContrastRed))
+        let redStart = coordinator.currentStimulus?.acuityDenominator
+
+        // Run red badly enough that its own result differs from high contrast's.
+        runCondition(coordinator, speech, answerCorrect: { _ in false })
+        XCTAssertEqual(coordinator.phase, .lowContrast(.lowContrastGreen))
+        XCTAssertEqual(coordinator.currentStimulus?.acuityDenominator, redStart)
+        XCTAssertEqual(redStart, 32)
+    }
+
+    /// Skipping the gate with Next records no high-contrast result, so there is nothing to anchor
+    /// to and low contrast falls back to the protocol start.
+    func testLowContrastFallsBackToProtocolStartWhenGateSkipped() {
+        let (coordinator, distance, speech) = makeCoordinator(order: [.lowContrastRed, .lowContrastGreen])
+        coordinator.beginAfterSetup()
+        lockDistance(distance)
+        completeWarmup(coordinator, speech)
+        XCTAssertEqual(coordinator.phase, .highContrastGate)
+
+        XCTAssertTrue(coordinator.goNext())
+        XCTAssertEqual(coordinator.phase, .lowContrast(.lowContrastRed))
+        XCTAssertNil(coordinator.currentSessionSnapshot.highContrast)
+        XCTAssertEqual(coordinator.currentStimulus?.acuityDenominator, coordinator.config.startAcuity)
+    }
+
+    /// Back-navigation out of low contrast clears the high-contrast result, so the re-run
+    /// re-derives its own anchor instead of reusing the abandoned one.
+    func testLowContrastStartIsRederivedAfterBackNavigation() {
+        let (coordinator, distance, speech) = makeCoordinator(order: [.lowContrastRed, .lowContrastGreen])
+        coordinator.beginAfterSetup()
+        lockDistance(distance)
+        completeWarmup(coordinator, speech)
+        runCondition(coordinator, speech, answerCorrect: { $0 >= 20 })
+        XCTAssertEqual(coordinator.currentStimulus?.acuityDenominator, 32)
+
+        XCTAssertTrue(coordinator.goBack())                 // back to a fresh high-contrast run
+        XCTAssertEqual(coordinator.phase, .highContrastGate)
+        XCTAssertNil(coordinator.currentSessionSnapshot.highContrast)
+        XCTAssertEqual(coordinator.currentStimulus?.acuityDenominator, coordinator.config.startAcuity)
+
+        // A weaker re-run anchors the low-contrast start higher up the ladder.
+        runCondition(coordinator, speech, answerCorrect: { $0 >= 25 })
+        XCTAssertEqual(coordinator.phase, .lowContrast(.lowContrastRed))
+        XCTAssertEqual(coordinator.currentStimulus?.acuityDenominator, 40)
+    }
+
+    /// The 20/25 result no longer gates the flow, so a below-gate anchor is real: a child who
+    /// passed only 20/50 under high contrast starts low contrast two rungs coarser, at 20/80.
+    func testLowContrastStartAfterBelowGateResultAnchorsToPassedLine() {
+        let (coordinator, distance, speech) = makeCoordinator(order: [.lowContrastRed, .lowContrastGreen])
+        coordinator.beginAfterSetup()
+        lockDistance(distance)
+        completeWarmup(coordinator, speech)
+
+        // 20/40 fails, 20/50 passes; advancing back into the failed 20/40 brackets the threshold.
+        runCondition(coordinator, speech, answerCorrect: { $0 >= 50 })
+        XCTAssertEqual(coordinator.phase, .lowContrast(.lowContrastRed))
+        XCTAssertEqual(coordinator.currentSessionSnapshot.highContrast?.finestAcuityDenominator, 50)
+        XCTAssertFalse(coordinator.currentSessionSnapshot.highContrast?.reachedGate ?? true)
+        XCTAssertEqual(coordinator.currentStimulus?.acuityDenominator, 80)
+    }
+
+    /// Nothing passed: `finestAcuityDenominator` is the coarser terminal line (20/200), and two
+    /// rungs coarser clamps to the coarsest rung rather than falling off the ladder.
+    func testLowContrastStartClampsToCoarsestRungWhenNothingPassed() {
+        let (coordinator, distance, speech) = makeCoordinator(order: [.lowContrastRed, .lowContrastGreen])
+        coordinator.beginAfterSetup()
+        lockDistance(distance)
+        completeWarmup(coordinator, speech)
+
+        runCondition(coordinator, speech, answerCorrect: { _ in false })
+        XCTAssertEqual(coordinator.phase, .lowContrast(.lowContrastRed))
+        XCTAssertEqual(coordinator.currentSessionSnapshot.highContrast?.finestAcuityDenominator, 200)
+        XCTAssertEqual(coordinator.currentStimulus?.acuityDenominator, 200)
+    }
+
+    // MARK: - Inter-stimulus blank
+
+    /// Long enough to clear the 0.05 s blank the tests below configure.
+    private func awaitBlank() async {
+        try? await Task.sleep(nanoseconds: 200_000_000)
+    }
+
+    /// The next letter is committed but HIDDEN during the blank, and recognition is not armed —
+    /// an answer must never be timed from a blank field.
+    func testBlankHoldsStimulusHiddenAndDefersListening() async {
+        let (coordinator, distance, speech) = makeCoordinator(blankSeconds: 0.05)
+        coordinator.beginAfterSetup()
+        lockDistance(distance)
+        XCTAssertEqual(coordinator.phase, .warmup)
+
+        // The first warm-up letter is committed behind the blank.
+        XCTAssertTrue(coordinator.isBlankInterval)
+        XCTAssertNotNil(coordinator.currentStimulus)
+        XCTAssertFalse(speech.hasPending, "recognition must not arm while the square is black")
+
+        await awaitBlank()
+        XCTAssertFalse(coordinator.isBlankInterval)
+        XCTAssertTrue(speech.hasPending)
+    }
+
+    /// Every letter-to-letter transition blanks, warm-up included.
+    func testBlankPrecedesEachSubsequentLetter() async {
+        let (coordinator, distance, speech) = makeCoordinator(blankSeconds: 0.05)
+        coordinator.beginAfterSetup()
+        lockDistance(distance)
+        await awaitBlank()
+        guard let first = coordinator.currentStimulus?.letter else {
+            return XCTFail("no first warm-up letter")
+        }
+
+        speech.answer(.letter(first))
+        // The NEXT letter is already committed, but blanked and silent.
+        XCTAssertTrue(coordinator.isBlankInterval)
+        XCTAssertNotNil(coordinator.currentStimulus)
+        XCTAssertFalse(speech.hasPending)
+
+        await awaitBlank()
+        XCTAssertFalse(coordinator.isBlankInterval)
+        XCTAssertTrue(speech.hasPending)
+        XCTAssertEqual(coordinator.warmupCompleted, 1)
+    }
+
+    /// A distance pause landing mid-blank cancels it: the square never sticks black, and the
+    /// cancelled reveal must not fire late and arm recognition into a paused trial.
+    func testDistancePauseDuringBlankCancelsIt() async {
+        let (coordinator, distance, speech) = makeCoordinator(blankSeconds: 0.05)
+        coordinator.beginAfterSetup()
+        lockDistance(distance)
+        XCTAssertTrue(coordinator.isBlankInterval)
+
+        distance.push(.outOfRange(rawCM: 50))
+        XCTAssertTrue(coordinator.isPausedForDistance)
+        XCTAssertFalse(coordinator.isBlankInterval)
+        XCTAssertNil(coordinator.currentStimulus)
+
+        await awaitBlank()
+        XCTAssertFalse(coordinator.isBlankInterval)
+        XCTAssertFalse(speech.hasPending, "a cancelled blank must never reveal late")
+    }
+
+    /// The synchronous fast path the rest of this suite depends on: a zero blank presents and
+    /// arms recognition in the same run-loop turn.
+    func testZeroBlankPresentsSynchronously() {
+        let (coordinator, distance, speech) = makeCoordinator(blankSeconds: 0)
+        coordinator.beginAfterSetup()
+        lockDistance(distance)
+        XCTAssertFalse(coordinator.isBlankInterval)
+        XCTAssertNotNil(coordinator.currentStimulus)
+        XCTAssertTrue(speech.hasPending)
+    }
 }
+

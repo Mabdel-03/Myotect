@@ -38,3 +38,30 @@ protocol ContinuousCaptureControlling: AnyObject {
     func endCaptureSession()
     var captureEvents: AnyPublisher<CaptureEvent, Never> { get }
 }
+
+/// One completed step of the live recognizer, for the operator-facing "Heard" line on the trial
+/// screen. Diagnostics are display only — the trial is resolved solely through the
+/// `recognizeOneLetter` callback — so a view can never be ahead of, or disagree with, the score.
+struct RecognitionDiagnostic: Equatable {
+    enum Kind: Equatable {
+        /// The microphone is armed for a letter and nothing has been transcribed yet.
+        case listening
+        /// A transcription pass completed: what Whisper returned and how it classified.
+        case heard(raw: String, outcome: RecognitionOutcome)
+        /// The no-input deadline was pushed back because sound was still being collected.
+        case deferredDeadline(seconds: TimeInterval)
+        /// The deadline flush found no speech-length sound and ended the window as silence.
+        case flushedSilent
+    }
+
+    let kind: Kind
+    let at: Date
+}
+
+/// Adopted by services that can narrate what they hear (the WhisperKit service). The coordinator
+/// reaches it via `as?`, exactly like ``ContinuousCaptureControlling``; the mock and the keypad
+/// service do not adopt it.
+@MainActor
+protocol RecognitionDiagnosticsProviding: AnyObject {
+    var diagnostics: AnyPublisher<RecognitionDiagnostic, Never> { get }
+}

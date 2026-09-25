@@ -69,7 +69,8 @@ struct SessionStore {
             .sorted { ($0.completedAt ?? $0.startedAt) > ($1.completedAt ?? $1.startedAt) }
     }
 
-    /// One header row plus one row per trial.
+    /// One header row plus one row per recorded trial (counted and uncounted alike — see
+    /// `counts_toward_staircase`).
     func csv(for session: MyopiaScreenSession) -> String {
         let header = [
             "session_id", "started_at", "condition", "acuity_20x", "shown_letter",
@@ -78,9 +79,14 @@ struct SessionStore {
             "sizing_version", "calibration_source", "points_per_mm", "screen_signature",
             "target_height_mm", "rendered_height_points",
             // Session-level constant repeated per row: with contrast operator-selectable, every
-            // trial row must carry the Weber value that produced it. Appended last so columns
-            // 1-18 stay positionally stable for existing analysis scripts.
+            // trial row must carry the Weber value that produced it.
             "weber_contrast",
+            // 1 for a row the staircase consumed, 0 for a voice no-input row (recorded, not
+            // counted, replaced by a fresh letter — since 2026-09-03). Rows from before the
+            // field existed read 1. House rule: new columns are APPENDED so every existing
+            // column keeps its position for analysis scripts — columns 1-19 are frozen;
+            // `counts_toward_staircase` is column 20.
+            "counts_toward_staircase",
         ].joined(separator: ",")
 
         let formatter = ISO8601DateFormatter()
@@ -107,6 +113,9 @@ struct SessionStore {
                 trial.provenance.map { String(format: "%.3f", $0.targetHeightMillimeters) } ?? "",
                 trial.provenance.map { String(format: "%.2f", $0.renderedHeightPoints) } ?? "",
                 String(format: "%.2f", session.weberContrast),
+                // Explicit 1/0 like `is_correct` (never empty): a legacy row was definitely
+                // counted, so the column loads as an integer with no missing values.
+                (trial.countsTowardStaircase ?? true) ? "1" : "0",
             ].joined(separator: ",")
         }
 

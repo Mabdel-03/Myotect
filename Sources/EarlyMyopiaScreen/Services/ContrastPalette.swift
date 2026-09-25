@@ -5,13 +5,14 @@ import SwiftUI
 /// Uses the Weber contrast definition for letter tests:
 /// `contrast = (background - stimulus) / background`, i.e. `stimulus = background * (1 - weber)`.
 struct ContrastConfig {
-    /// Weber contrast. 0.10 (10%) is the default; the operator may select 0.05 / 0.10 / 0.15
-    /// in Settings (see `ScreeningSettingsProvider`).
-    var weber: Double = 0.10
+    /// Weber contrast. 0.20 (20%) is the default; the operator may select 0.05 / 0.10 / 0.15 /
+    /// 0.20 in Settings (see `ScreeningSettingsProvider`). Nominal sRGB-channel contrast, not
+    /// photometric (see `ContrastPalette`).
+    var weber: Double = 0.20
     /// Background channel brightness in 0...1. The stimulus is darker by the Weber fraction.
     var backgroundBrightness: Double = 1.0
 
-    init(weber: Double = 0.10, backgroundBrightness: Double = 1.0) {
+    init(weber: Double = 0.20, backgroundBrightness: Double = 1.0) {
         self.weber = weber
         self.backgroundBrightness = backgroundBrightness
     }

@@ -33,7 +33,10 @@ private final class ManualDistanceProvider: DistanceProvider {
 private final class ScriptedSpeechService: LetterRecognitionService {
     let isAvailable = true
     private var pending: ((RecognitionOutcome) -> Void)?
+    /// The no-input window the coordinator armed the last request with.
+    private(set) var lastTimeout: TimeInterval?
     func recognizeOneLetter(timeout: TimeInterval, onOutcome: @escaping (RecognitionOutcome) -> Void) {
+        lastTimeout = timeout
         pending = onOutcome
     }
     func cancel() { pending = nil }
@@ -53,14 +56,26 @@ private final class MockAnnouncer: PatientAudioPrompting {
     private let subject = PassthroughSubject<SpeechEvent, Never>()
     var events: AnyPublisher<SpeechEvent, Never> { subject.eraseToAnyPublisher() }
 
+    /// When true, completions are held until `finishSpeaking()` — the real announcer completes
+    /// when the utterance ENDS, and some coordinator paths present in that completion.
+    var holdCompletions = false
+    private var heldCompletions: [() -> Void] = []
+
     func speak(_ prompt: SpokenPrompt, completion: (() -> Void)?) {
         spoken.append(prompt)
-        completion?()
+        if holdCompletions, let completion {
+            heldCompletions.append(completion)
+        } else {
+            completion?()
+        }
     }
     func stop() {}
     func setMicrophoneCaptureActive(_ active: Bool) {}
     func finishSpeaking() {
         isSpeaking = false
+        let completions = heldCompletions
+        heldCompletions = []
+        completions.forEach { $0() }
         subject.send(.finished)
     }
 }
@@ -72,6 +87,8 @@ final class CoordinatorTTSTests: XCTestCase {
         -> (MyopiaScreenCoordinator, ManualDistanceProvider, ScriptedSpeechService, MockAnnouncer) {
         var config = ScreenConfig()
         config.listenResumeAfterSpeechSeconds = listenResumeDelay
+        // Synchronous presentation: these tests answer and immediately read the next stimulus.
+        config.interstimulusBlankSeconds = 0
         let distance = ManualDistanceProvider()
         let speech = ScriptedSpeechService()
         let announcer = MockAnnouncer()
@@ -123,11 +140,109 @@ final class CoordinatorTTSTests: XCTestCase {
         XCTAssertEqual(coordinator.phase, .highContrastGate)
         XCTAssertFalse(announcer.spoken.contains(.tryAgain))
 
-        speech.answer(.unrecognized(.silence))
+        speech.answer(.unrecognized(.filler))
         XCTAssertEqual(announcer.spoken.filter { $0 == .tryAgain }.count, 1)
         // The second retry is silent.
-        speech.answer(.unrecognized(.silence))
+        speech.answer(.unrecognized(.filler))
         XCTAssertEqual(announcer.spoken.filter { $0 == .tryAgain }.count, 1)
+    }
+
+    func testNoInputRowDoesNotSpeakReprompt() {
+        let (coordinator, distance, speech, announcer) = makeCoordinator()
+        coordinator.beginAfterSetup()
+        lockDistance(distance)
+        for _ in 0..<coordinator.config.warmupLetterCount {
+            guard let letter = coordinator.currentStimulus?.letter else { break }
+            speech.answer(.letter(letter))
+        }
+        XCTAssertEqual(coordinator.phase, .highContrastGate)
+
+        // Voice silence on a scored trial is recorded, not retried: no re-prompt, one uncounted
+        // row, a fresh letter listening at the same level.
+        speech.answer(.unrecognized(.silence))
+        XCTAssertFalse(announcer.spoken.contains(.tryAgain))
+        XCTAssertEqual(coordinator.currentSessionSnapshot.trials.count, 1)
+        XCTAssertEqual(coordinator.currentSessionSnapshot.trials.first?.countsTowardStaircase, false)
+        XCTAssertEqual(coordinator.currentStimulus?.acuityDenominator, 40)
+        XCTAssertTrue(speech.hasPending)
+    }
+
+    func testRepromptRetryBlanksLetterUntilPromptEnds() {
+        let (coordinator, distance, speech, announcer) = makeCoordinator()
+        coordinator.beginAfterSetup()
+        lockDistance(distance)
+        for _ in 0..<coordinator.config.warmupLetterCount {
+            guard let letter = coordinator.currentStimulus?.letter else { break }
+            speech.answer(.letter(letter))
+        }
+        XCTAssertEqual(coordinator.phase, .highContrastGate)
+        let letter = coordinator.currentStimulus?.letter
+
+        // The microphone is off while the re-prompt plays, so the letter must not sit on
+        // screen inviting an answer nobody can hear: the square blanks until the prompt ends.
+        announcer.holdCompletions = true
+        speech.answer(.unrecognized(.filler))
+        XCTAssertTrue(announcer.spoken.contains(.tryAgain))
+        XCTAssertTrue(coordinator.isBlankInterval)
+        // The stimulus stays committed while blanked, so the blue frame stays up (a nil
+        // stimulus would render a full black screen).
+        XCTAssertNotNil(coordinator.currentStimulus)
+        XCTAssertFalse(speech.hasPending)
+
+        announcer.finishSpeaking()
+        XCTAssertFalse(coordinator.isBlankInterval)
+        XCTAssertEqual(coordinator.currentStimulus?.letter, letter)
+        XCTAssertTrue(speech.hasPending)
+        XCTAssertTrue(coordinator.currentSessionSnapshot.trials.isEmpty)
+    }
+
+    func testWarmupRepromptRetryBlanksUntilPromptEnds() {
+        let (coordinator, distance, speech, announcer) = makeCoordinator()
+        coordinator.beginAfterSetup()
+        lockDistance(distance)
+        XCTAssertEqual(coordinator.phase, .warmup)
+        let first = coordinator.currentStimulus?.letter
+
+        announcer.holdCompletions = true
+        speech.answer(.unrecognized(.filler))
+        XCTAssertTrue(announcer.spoken.contains(.tryAgain))
+        XCTAssertTrue(coordinator.isBlankInterval)
+        XCTAssertNotNil(coordinator.currentStimulus)
+        XCTAssertFalse(speech.hasPending)
+        XCTAssertEqual(coordinator.warmupCompleted, 0)
+
+        announcer.finishSpeaking()
+        XCTAssertFalse(coordinator.isBlankInterval)
+        // Warm-up retries present a FRESH letter.
+        XCTAssertNotEqual(coordinator.currentStimulus?.letter, first)
+        XCTAssertTrue(speech.hasPending)
+        XCTAssertEqual(coordinator.warmupCompleted, 0)
+        XCTAssertTrue(coordinator.currentSessionSnapshot.trials.isEmpty)
+    }
+
+    func testTeardownDuringRepromptClearsBlankAndIgnoresLateCompletion() {
+        let (coordinator, distance, speech, announcer) = makeCoordinator()
+        coordinator.beginAfterSetup()
+        lockDistance(distance)
+        for _ in 0..<coordinator.config.warmupLetterCount {
+            guard let letter = coordinator.currentStimulus?.letter else { break }
+            speech.answer(.letter(letter))
+        }
+        XCTAssertEqual(coordinator.phase, .highContrastGate)
+
+        announcer.holdCompletions = true
+        speech.answer(.unrecognized(.filler))
+        XCTAssertTrue(coordinator.isBlankInterval)
+
+        coordinator.teardown()
+        XCTAssertFalse(coordinator.isBlankInterval, "teardown must never leave the square black")
+
+        // The prompt's completion arriving after teardown finds a dead context: nothing
+        // re-presents, nothing listens, nothing is scored.
+        announcer.finishSpeaking()
+        XCTAssertFalse(coordinator.isBlankInterval)
+        XCTAssertFalse(speech.hasPending)
+        XCTAssertTrue(coordinator.currentSessionSnapshot.trials.isEmpty)
     }
 
     func testVoidHoldPromptIsNotSupersededByGuidanceSpeech() {
@@ -202,9 +317,10 @@ final class CoordinatorTTSTests: XCTestCase {
             guard let letter = coordinator.currentStimulus?.letter else { break }
             speech.answer(.letter(letter))
         }
-        // Fail out of the gate quickly (always wrong): session completes below the gate.
+        // Always wrong through all three conditions (a below-20/25 high-contrast result no
+        // longer ends the session): the session completes after teal.
         var guardCount = 0
-        while speech.hasPending, coordinator.phase == .highContrastGate, guardCount < 400 {
+        while speech.hasPending, coordinator.phase != .results, guardCount < 400 {
             guardCount += 1
             guard let stim = coordinator.currentStimulus else { break }
             let wrong = SloanLetter.all.first { $0 != stim.letter } ?? stim.letter

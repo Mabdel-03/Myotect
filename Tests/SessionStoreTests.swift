@@ -42,17 +42,22 @@ final class SessionStoreTests: XCTestCase {
         return s
     }
 
-    private func trial(_ condition: ColorCondition, n: Int) -> TrialResult {
+    /// `countsTowardStaircase` defaults to nil so every existing call site stays legacy-shaped
+    /// (a row written before the flag existed).
+    private func trial(_ condition: ColorCondition, n: Int,
+                       response: String = "C", isCorrect: Bool = true,
+                       countsTowardStaircase: Bool? = nil) -> TrialResult {
         TrialResult(condition: condition, acuityDenominator: 25, shownLetter: "C",
-                    response: "C", isCorrect: true, distanceCM: 200, responseTimeMS: 800,
-                    trialNumber: n, timestamp: Date(timeIntervalSince1970: 1_700_000_050))
+                    response: response, isCorrect: isCorrect, distanceCM: 200, responseTimeMS: 800,
+                    trialNumber: n, timestamp: Date(timeIntervalSince1970: 1_700_000_050),
+                    countsTowardStaircase: countsTowardStaircase)
     }
 
     func testJSONRoundTrip() throws {
         let store = SessionStore()
         let session = makeSession(trials: [trial(.highContrast, n: 1)])
         let data = try store.encodeJSON(session)
-        var decoder = JSONDecoder()
+        let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         let restored = try decoder.decode(MyopiaScreenSession.self, from: data)
         XCTAssertEqual(restored.sessionID, session.sessionID)
@@ -70,7 +75,7 @@ final class SessionStoreTests: XCTestCase {
         // Provenance and sizing-distance columns are always present; legacy trials leave them empty.
         for column in ["sizing_distance_cm", "sizing_version", "calibration_source",
                        "points_per_mm", "screen_signature", "target_height_mm",
-                       "rendered_height_points", "weber_contrast"] {
+                       "rendered_height_points", "weber_contrast", "counts_toward_staircase"] {
             XCTAssertTrue(lines[0].contains(column), "missing CSV column \(column)")
         }
         let headerFieldCount = lines[0].split(separator: ",", omittingEmptySubsequences: false).count
@@ -132,9 +137,14 @@ final class SessionStoreTests: XCTestCase {
             aborted: session.aborted, abortReason: session.abortReason)
 
         let lines = SessionStore().csv(for: session).split(separator: "\n").map(String.init)
-        XCTAssertTrue(lines[0].hasSuffix(",weber_contrast"))
+        // Column 19 is frozen; `counts_toward_staircase` was appended after it (column 20), so
+        // the pin is positional, and the append-last rule is itself pinned.
+        let header = lines[0].split(separator: ",", omittingEmptySubsequences: false)
+        XCTAssertEqual(String(header[18]), "weber_contrast")
+        XCTAssertTrue(lines[0].hasSuffix(",counts_toward_staircase"))
         for row in lines.dropFirst() {
-            XCTAssertTrue(row.hasSuffix(",0.15"), "row missing weber contrast: \(row)")
+            XCTAssertEqual(String(row.split(separator: ",", omittingEmptySubsequences: false)[18]),
+                           "0.15", "row missing weber contrast: \(row)")
         }
     }
 
@@ -212,5 +222,80 @@ final class SessionStoreTests: XCTestCase {
             trials: session.trials,
             aborted: session.aborted,
             abortReason: session.abortReason)
+    }
+
+    func testNonLetterResponseSentinelsStayUnquotedAndAlignedInCSVAndJSON() throws {
+        // The sentinels are written verbatim; they contain spaces but never a comma, quote, or
+        // newline, so the CSV stays 20 plain columns even for a parser that is not quote-aware.
+        let sentinels = [TrialResult.NonLetterResponse.clinicianNoResponse,
+                         TrialResult.NonLetterResponse.skipped,
+                         TrialResult.NonLetterResponse.noInput]
+        let trials = sentinels.enumerated().map { index, sentinel in
+            trial(.highContrast, n: index + 1, response: sentinel, isCorrect: false)
+        }
+        let store = SessionStore()
+        let session = makeSession(trials: trials)
+
+        let lines = store.csv(for: session).split(separator: "\n").map(String.init)
+        let headerCount = lines[0].split(separator: ",", omittingEmptySubsequences: false).count
+        XCTAssertEqual(headerCount, 20)
+        for (index, sentinel) in sentinels.enumerated() {
+            let fields = lines[index + 1].split(separator: ",", omittingEmptySubsequences: false)
+                .map(String.init)
+            XCTAssertEqual(fields.count, headerCount, "row for \"\(sentinel)\" is misaligned")
+            XCTAssertEqual(fields[5], sentinel)
+            XCTAssertEqual(fields[6], "0")
+            XCTAssertEqual(fields[19], "1", "a row without the flag is a counted legacy row")
+            XCTAssertFalse(lines[index + 1].contains("\""), "\"\(sentinel)\" must not be quoted")
+        }
+
+        let restored = try store.decodeJSON(store.encodeJSON(session))
+        XCTAssertEqual(restored.trials.map(\.response), sentinels)
+        XCTAssertTrue(restored.trials.allSatisfy { !$0.isCorrect })
+    }
+
+    // MARK: - counts_toward_staircase (column 20)
+
+    func testCountsTowardStaircaseRoundTripsThroughJSONAndCSVWithLegacyNilReadingAsOne() throws {
+        let trials = [
+            trial(.highContrast, n: 1, countsTowardStaircase: true),
+            trial(.highContrast, n: 2, response: TrialResult.NonLetterResponse.noInput,
+                  isCorrect: false, countsTowardStaircase: false),
+            trial(.highContrast, n: 2),                       // legacy shape: flag absent
+        ]
+        let store = SessionStore()
+        let session = makeSession(trials: trials)
+
+        let lines = store.csv(for: session).split(separator: "\n").map(String.init)
+        XCTAssertTrue(lines[0].hasSuffix(",counts_toward_staircase"))
+        XCTAssertEqual(lines.dropFirst().map { $0.split(separator: ",", omittingEmptySubsequences: false).last.map(String.init) },
+                       ["1", "0", "1"])
+
+        let restored = try store.decodeJSON(store.encodeJSON(session))
+        XCTAssertEqual(restored.trials.map(\.countsTowardStaircase), [true, false, nil])
+        XCTAssertEqual(restored, session)
+    }
+
+    /// A trial written before 2026-09-03 has no `countsTowardStaircase` key: it decodes as nil
+    /// and is treated as counted — including the 09-02-era `no input registered` misses.
+    func testLegacyTrialJSONWithoutTheFlagDecodesAsNilAndExportsAsCounted() throws {
+        let legacy = """
+        {"condition":"highContrast","acuityDenominator":40,"shownLetter":"C",
+         "response":"no input registered","isCorrect":false,"distanceCM":200.0,
+         "responseTimeMS":5200,"trialNumber":3,"timestamp":"2026-09-02T18:00:00Z"}
+        """
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let trial = try decoder.decode(TrialResult.self, from: Data(legacy.utf8))
+        XCTAssertNil(trial.countsTowardStaircase)
+        XCTAssertEqual(trial.response, TrialResult.NonLetterResponse.noInput)
+
+        let store = SessionStore()
+        let session = makeSession(trials: [trial])
+        let lines = store.csv(for: session).split(separator: "\n")
+        XCTAssertTrue(lines[1].hasSuffix(",1"), "legacy no-input rows were counted misses")
+        // Re-encoding keeps the row legacy-shaped: nil is omitted, never written as null/false.
+        let json = try XCTUnwrap(String(data: store.encodeJSON(session), encoding: .utf8))
+        XCTAssertFalse(json.contains("countsTowardStaircase"))
     }
 }

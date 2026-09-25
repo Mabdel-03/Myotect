@@ -57,18 +57,32 @@ struct ScreenConfig {
     var trialsPerLevel: Int = 5
     var advanceThreshold: Int = 3
     var earlySkipCount: Int = 3
-    /// Gate denominator for the high-contrast condition.
+    /// The 20/25 reference level for the high-contrast condition: `reachedGate` on its result
+    /// records whether the finest PASSED line reached it. Recorded for analysis only — it does
+    /// not gate the flow; the low-contrast conditions always run.
     var gateAcuity: Int = 25
+    /// How many ladder steps COARSER (bigger letters) than the high-contrast result the
+    /// low-contrast conditions begin at. A low-contrast letter is harder to read than the
+    /// same-size high-contrast one, so the run opens with headroom above the child's own
+    /// demonstrated line instead of a fixed level.
+    var lowContrastStartOffsetSteps: Int = 2
 
     // MARK: Contrast
-    /// Weber contrast for the two low-contrast conditions. 10% by default; operator-selectable
-    /// 5/10/15% in Settings. Read once when the screening flow launches — immutable mid-session
-    /// (and recorded on the session as `weberContrast`).
-    var lowContrastWeber: Double = 0.10
+    /// Weber contrast for the two low-contrast conditions. 20% by default; operator-selectable
+    /// 5/10/15/20% in Settings. Read once when the screening flow launches — immutable
+    /// mid-session (and recorded on the session as `weberContrast`). Nominal sRGB-channel
+    /// contrast, not photometric (see `ContrastPalette`).
+    var lowContrastWeber: Double = 0.20
     var backgroundBrightness: Double = 1.0
 
     // MARK: Display
     var testBrightness: CGFloat = 1.0
+
+    /// Inter-stimulus interval: the colored square renders black (letter hidden, blue frame
+    /// steady) for this long before every optotype appears, so one letter never swaps straight
+    /// into the next. Zero presents synchronously — the coordinator tests set it to 0 to keep
+    /// trial flow deterministic, exactly as they already do for `listenResumeAfterSpeechSeconds`.
+    var interstimulusBlankSeconds: TimeInterval = 0.25
 
     /// Clearance (points) between the largest permitted glyph and the colored square's edge.
     var optotypeSquareInnerMargin: Double = 12
@@ -83,12 +97,58 @@ struct ScreenConfig {
     var warmupAcuity: Int = 80
 
     // MARK: Speech
-    /// Per-answer listening window before the final flush ends the attempt. 8 s (up from the
-    /// original 6) leaves room for a hesitant child once Whisper's ~0.5 s poll cadence and
-    /// inference latency eat into the tail; the retry cap bounds the worst case.
-    var recognitionTimeoutSeconds: TimeInterval = 8
-    /// Failed attempts (unrecognized/ambiguous) allowed per trial before the trial escalates to
-    /// the clinician keypad. The first retry carries a spoken re-prompt.
+    /// The no-input window (SOFT, 10 s): how long the microphone listens for the child's answer,
+    /// timed from the first microphone audio after the letter is revealed — after the
+    /// inter-stimulus blank and any spoken prompt plus `listenResumeAfterSpeechSeconds`, never
+    /// from a blank field or the app's own speech. Soft: the deadline never fires while voice is
+    /// in the newest `utteranceEndQuietSeconds` of audio or a transcription is in flight; the
+    /// service defers it in `deadlineDeferralStepSeconds` steps up to `deadlineDeferralCapSeconds`,
+    /// then flushes (worst case ≈ window + cap + the inference drain + one decode, ~15 s). A late
+    /// answer is scored for THIS letter. Only a window with no speech-length sound AND no usable
+    /// text is delivered as `.unrecognized(.silence)`, which the scored voice path records as a
+    /// "no input registered" row that does NOT count toward the staircase — a fresh letter
+    /// replaces it (PROTOCOL §7, 2026-09-03). The coordinator only passes this value to
+    /// `recognizeOneLetter(timeout:)`; the service owns the clock. Was 5 s while silence scored a
+    /// miss; 8 s when it merely retried.
+    var recognitionTimeoutSeconds: TimeInterval = 10
+    /// Backstop for a child (or microphone) that stays silent: after this many CONSECUTIVE voice
+    /// trials ended by the no-input window, the next presentation goes to the clinician keypad.
+    /// Since a no-input trial is recorded but never fed to the staircase, silence alone can never
+    /// move the level or end a condition — without this backstop the same level would re-present
+    /// fresh letters forever with no operator signal (the operator status strip is hidden in
+    /// voice mode). It is the ONLY exit from that loop. Any spoken letter, skip, or keypad entry
+    /// resets the count; the hand-off counts as an escalation for sticky-manual purposes.
+    var noInputTrialsBeforeEscalation: Int = 3
+    /// Step by which the soft deadline is pushed back each time it lands on voice in the tail or
+    /// an in-flight inference — the poll cadence that lets a late answer be scored for its letter.
+    var deadlineDeferralStepSeconds: TimeInterval = 0.25
+    /// Total deferral allowed past `recognitionTimeoutSeconds` before the window is flushed
+    /// regardless — a television keeps the tail "voiced" forever.
+    var deadlineDeferralCapSeconds: TimeInterval = 3.0
+    /// A live transcription runs only once the answer has ENDED: the newest this-many seconds of
+    /// audio must read as silence (Whisper completes a truncated first syllable into a
+    /// non-letter word). Also exactly the tail a non-answer pass leaves unconsumed, so an
+    /// utterance straddling a pass boundary keeps its onset without re-triggering on the
+    /// fragment before it (the two are equal on purpose).
+    var utteranceEndQuietSeconds: TimeInterval = 0.3
+    /// A sound continuous for this long is transcribed anyway (a long answer, a noisy room). Also
+    /// bounds how much of a voice run that began BEFORE the letter appeared is skipped as carried
+    /// over from the previous letter.
+    var maximumUtteranceSeconds: TimeInterval = 2.0
+    /// Per-100 ms block energy, relative (0…1) to the quietest of the previous 2 s, above which a
+    /// block reads as voice. Blocks below −80 dBFS never serve as the reference. WhisperKit's
+    /// default; tunable for the 2 m test distance.
+    var voiceSilenceThreshold: Float = 0.10
+    /// Audio kept behind the session start whenever the capture buffer is trimmed (at each arm,
+    /// after a cancel, at block ends): must cover the 2 s silence reference plus the block the
+    /// carried-over-voice rule inspects.
+    var capturePurgeKeepSeconds: TimeInterval = 3.0
+    /// WhisperKit's own live buffer grows for the life of an engine; once it holds this much
+    /// audio (~7.7 MB) the engine is paused for a few milliseconds, the buffer emptied, and the
+    /// engine resumed — between letters or during a pause, never on a reveal.
+    var captureBufferTrimAfterSeconds: TimeInterval = 120
+    /// Failed attempts (ambiguous / filler / unintelligible) allowed per trial before the trial
+    /// escalates to the clinician keypad. The first retry carries a spoken re-prompt.
     var maxAutoRetriesPerTrial: Int = 2
     /// Consecutive escalated trials after which manual mode becomes sticky until the clinician
     /// explicitly restores voice input.
@@ -104,9 +164,16 @@ struct ScreenConfig {
     var ttsRate: Float = 0.5
     /// Delay after an audio-session category switch before speaking, so the onset isn't clipped.
     var categorySettleSeconds: TimeInterval = 0.15
-    /// Delay between an announcement finishing and recognition re-arming, so the tail of the
-    /// prompt never bleeds into Whisper's capture window (gold-standard: 1.5 s).
-    var listenResumeAfterSpeechSeconds: TimeInterval = 1.5
+    /// Delay between an announcement finishing and recognition re-arming when a prompt was
+    /// still playing at the reveal. The reference app used 1.5 s to cover a cold engine restart
+    /// after a `.playback` category flip; here the announcer speaks UNDER the live capture
+    /// session with no flip, the microphone is live throughout, the prompt's echo lies before
+    /// the session start and is never inspected, and a ring-down straddling the start is
+    /// skipped as carried-over voice — only the speaker's drain (~0.2 s) needs to clear. Raise to
+    /// 0.75 s if device logs ever show prompt words inside a session. Known limitation: with the
+    /// non-default `speakEveryTrialPrompt`, the letter is visible while the prompt plays, so an
+    /// answer given during the prompt is not heard (the child repeats it).
+    var listenResumeAfterSpeechSeconds: TimeInterval = 0.5
     /// Minimum interval before the SAME distance-guidance prompt repeats.
     var distancePromptMinIntervalSeconds: TimeInterval = 5
     /// When true, "Say the letter you see." is spoken before every scored trial (default: only
@@ -119,16 +186,36 @@ struct ScreenConfig {
 
     init() {}
 
-    /// Builds a staircase config for a condition; only the high-contrast condition is gated.
-    func staircaseConfig(gated: Bool) -> AcuityStaircaseConfig {
+    /// The flow's config sampled from the operator's persisted settings at launch — the only
+    /// settings → config seam (`ContentView.screeningConfig()`).
+    init(settings: ScreeningSettings) {
+        lowContrastWeber = settings.weberChoice.rawValue
+        ttsEnabled = settings.audioEnabled
+    }
+
+    /// Builds a staircase config for a condition; only the high-contrast condition carries the
+    /// 20/25 reference level (`gateAcuity`), which is recorded on its result, never a flow branch.
+    /// `overrideStart` seeds a different starting level than the protocol default (the
+    /// low-contrast conditions start from the high-contrast result — see
+    /// ``acuityLevel(coarserBy:than:)``).
+    func staircaseConfig(gated: Bool, startAcuity overrideStart: Int? = nil) -> AcuityStaircaseConfig {
         var config = AcuityStaircaseConfig()
         config.acuityLevels = acuityLevels
-        config.startAcuity = startAcuity
+        config.startAcuity = overrideStart ?? startAcuity
         config.trialsPerLevel = trialsPerLevel
         config.advanceThreshold = advanceThreshold
         config.earlySkipCount = earlySkipCount
         config.gateAcuity = gated ? gateAcuity : nil
         return config
+    }
+
+    /// The level `steps` rungs coarser (larger letters) than `acuity` on ``acuityLevels``,
+    /// clamped to the coarsest level. Falls back to ``startAcuity`` when `acuity` is not a
+    /// configured level, so the result is never off-ladder: `AcuityStaircaseEngine.init`
+    /// silently drops an unknown `startAcuity` to the coarsest rung.
+    func acuityLevel(coarserBy steps: Int, than acuity: Int) -> Int {
+        guard let index = acuityLevels.firstIndex(of: acuity) else { return startAcuity }
+        return acuityLevels[max(0, index - steps)]
     }
 
     /// Contrast config for a low-contrast condition (high contrast ignores this).

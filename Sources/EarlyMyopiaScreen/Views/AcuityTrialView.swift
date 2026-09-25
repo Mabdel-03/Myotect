@@ -3,14 +3,18 @@ import SwiftUI
 /// Shared trial UI for the high-contrast gate and the low-contrast conditions.
 ///
 /// Shows the optotype with no scored correctness feedback to the child. Overlays a distance-pause
-/// banner, an optional clinician keypad (when the manual service is in use), and a debug panel
-/// gated behind a developer flag.
+/// banner, an optional clinician keypad (when the manual service is in use), the operator-only
+/// "Heard" line at the top in voice mode (`HeardDiagnosticLine`), and a debug panel gated behind
+/// a developer flag.
 struct AcuityTrialView: View {
     @ObservedObject var coordinator: MyopiaScreenCoordinator
     /// The manual clinician service, if that recognition path is active.
     var clinician: ManualClinicianService?
     /// Developer-only overlay (expected letter, etc.). Never shown to participants by default.
     var showDebugOverlay = false
+    /// Hosts that already show a top pill (the warm-up) pass `false` and place the line
+    /// themselves so the two never overlap.
+    var showsHeardLine = true
 
     var body: some View {
         ZStack {
@@ -18,6 +22,7 @@ struct AcuityTrialView: View {
                 OptotypeView(
                     stimulus: stimulus,
                     squareSide: coordinator.squareSidePoints,
+                    isBlanked: coordinator.isBlankInterval,
                     borderGap: coordinator.config.optotypeBorderGap,
                     borderWidth: coordinator.config.optotypeBorderWidth)
             } else {
@@ -34,6 +39,10 @@ struct AcuityTrialView: View {
 
             if showOperatorStatus {
                 operatorStatusStrip
+            }
+
+            if showsHeardLine {
+                heardLine
             }
 
             if showDebugOverlay {
@@ -64,6 +73,18 @@ struct AcuityTrialView: View {
             }
             .padding(.bottom, 4)
         }
+    }
+
+    /// Top-anchored below the Back/Next capsule row (`ScreeningRootView` overlays, ~90–100 pt at
+    /// each top corner), so it never sits over the centred optotype and never meets the
+    /// bottom-anchored keypad or operator strip.
+    private var heardLine: some View {
+        VStack {
+            HeardDiagnosticLine(coordinator: coordinator)
+                .padding(.top, 56)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
     }
 
     private var operatorStatusText: String {

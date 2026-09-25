@@ -12,6 +12,9 @@ struct OptotypeView: View {
     let stimulus: MyopiaScreenCoordinator.Stimulus
     /// Side length (points) of the colored square holding the letter, derived by the coordinator.
     let squareSide: Double
+    /// Inter-stimulus interval: the square renders black and the letter is hidden. The blue frame
+    /// and every dimension stay put, so the child's fixation target never moves between letters.
+    var isBlanked = false
     /// Gap (points) on each side between the colored square and the blue border square.
     var borderGap: Double = 14
     /// Line width (points) of the blue border square.
@@ -24,12 +27,14 @@ struct OptotypeView: View {
             Color.black
                 .ignoresSafeArea()
 
-            stimulus.colors.background
+            (isBlanked ? Color.black : stimulus.colors.background)
                 .frame(width: squareSide, height: squareSide)
                 .overlay {
-                    Text(stimulus.letter)
-                        .font(.custom(FontRegistrar.sloanName, fixedSize: stimulus.fontPoints))
-                        .foregroundStyle(stimulus.colors.stimulus)
+                    if !isBlanked {
+                        Text(stimulus.letter)
+                            .font(.custom(FontRegistrar.sloanName, fixedSize: stimulus.fontPoints))
+                            .foregroundStyle(stimulus.colors.stimulus)
+                    }
                 }
 
             // The blue border square wrapping the colored square with a small gap.

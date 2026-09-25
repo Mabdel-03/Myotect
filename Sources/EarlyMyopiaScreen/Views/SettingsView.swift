@@ -62,7 +62,7 @@ struct SettingsView: View {
                 .myoHeader2()
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
-            Text("Weber contrast for the two low-contrast conditions. Applies to the next screening; a screening in progress is unaffected.")
+            Text("Weber contrast for the two low-contrast conditions. Protocol default is 20%. Applies to the next screening; a screening in progress is unaffected.")
                 .myoSmallText()
                 .multilineTextAlignment(.center)
                 .padding(.top, 5)

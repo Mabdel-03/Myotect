@@ -81,11 +81,7 @@ struct ContentView: View {
 
     /// Builds the flow's config from the persisted operator settings, sampled at launch time.
     private static func screeningConfig() -> ScreenConfig {
-        let settings = ScreeningSettingsProvider().settings
-        var config = ScreenConfig()
-        config.lowContrastWeber = settings.weberChoice.rawValue
-        config.ttsEnabled = settings.audioEnabled
-        return config
+        ScreenConfig(settings: ScreeningSettingsProvider().settings)
     }
 }
 

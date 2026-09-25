@@ -90,4 +90,23 @@ final class RetryEscalationPolicyTests: XCTestCase {
         policy.beginTrial()
         XCTAssertEqual(policy.actionForFailedAttempt(), .escalateToManual) // maxRetries 0 still applies
     }
+
+    func testNoInputEscalationCountsTowardStickyAndOnlyAHeardVoiceAnswerClearsIt() {
+        var policy = makePolicy(stickyAfter: 2)
+        policy.noteNoInputEscalation()
+        XCTAssertEqual(policy.consecutiveEscalatedTrials, 1)
+        XCTAssertFalse(policy.isStickyManual)
+        // A HEARD voice answer (letter or skip) restarts the streak.
+        policy.trialResolved(byVoice: true)
+        XCTAssertEqual(policy.consecutiveEscalatedTrials, 0)
+        policy.noteNoInputEscalation()
+        XCTAssertEqual(policy.consecutiveEscalatedTrials, 1)
+        XCTAssertFalse(policy.isStickyManual)
+        // A keypad entry or a no-input row (byVoice: false) does not: silence proves nothing.
+        policy.trialResolved(byVoice: false)
+        XCTAssertEqual(policy.consecutiveEscalatedTrials, 1)
+        policy.noteNoInputEscalation()
+        XCTAssertEqual(policy.consecutiveEscalatedTrials, 2)
+        XCTAssertTrue(policy.isStickyManual)
+    }
 }
